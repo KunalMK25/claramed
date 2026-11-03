@@ -1,0 +1,250 @@
+"""
+Celery Background Tasks
+
+Defines background tasks for async processing.
+"""
+from celery import Task
+from backend.workers.celery_app import celery_app
+from backend.core.logging import get_logger
+from backend.database.connection import get_db_context
+from backend.models.analysis import MedicalAnalysis, AnalysisStatus
+from backend.models.result import AnalysisResult, ResultType
+from backend.services.document_service import DocumentService
+from backend.services.ocr_service import OCRService
+from backend.services.radiology_service import RadiologyService
+from backend.services.storage_service import StorageService
+from pathlib import Path
+from uuid import UUID
+from datetime import datetime
+
+logger = get_logger(__name__)
+
+
+class AnalysisTask(Task):
+    """Base task for analysis operations."""
+    
+    def on_failure(self, exc, task_id, args, kwargs, einfo):
+        """Handle task failure."""
+        logger.error(
+            f"Task failed: {task_id}",
+            exception=str(exc),
+            args=args,
+            kwargs=kwargs,
+        )
+        
+        # Update analysis status to failed
+        if args and len(args) > 0:
+            analysis_id = args[0]
+            try:
+                with get_db_context() as db:
+                    analysis = db.query(MedicalAnalysis).filter(
+                        MedicalAnalysis.id == UUID(analysis_id)
+                    ).first()
+                    
+                    if analysis:
+                        analysis.status = AnalysisStatus.FAILED
+                        analysis.error_message = str(exc)
+                        analysis.processing_completed_at = datetime.utcnow()
+                        db.commit()
+            except Exception as e:
+                logger.error(f"Failed to update analysis status: {str(e)}")
+
+
+@celery_app.task(bind=True, base=AnalysisTask, max_retries=3)
+def process_document_async(self, analysis_id: str, document_id: str):
+    """
+    Process uploaded document asynchronously.
+    
+    Args:
+        analysis_id: Analysis ID
+        document_id: Document ID
+    """
+    logger.info(f"Processing document async: {document_id}")
+    
+    try:
+        with get_db_context() as db:
+            analysis = db.query(MedicalAnalysis).filter(
+                MedicalAnalysis.id == UUID(analysis_id)
+            ).first()
+            
+            if not analysis:
+                raise ValueError(f"Analysis not found: {analysis_id}")
+            
+            # Get document
+            from backend.models.document import UploadedDocument
+            document = db.query(UploadedDocument).filter(
+                UploadedDocument.id == UUID(document_id)
+            ).first()
+            
+            if not document:
+                raise ValueError(f"Document not found: {document_id}")
+            
+            # Update analysis status
+            analysis.status = AnalysisStatus.PROCESSING
+            analysis.processing_started_at = datetime.utcnow()
+            db.commit()
+            
+            # Initialize services
+            storage_service = StorageService()
+            document_service = DocumentService()
+            ocr_service = OCRService()
+            
+            # Retrieve file from storage
+            temp_path = storage_service.get_file(document.storage_key)
+            
+            try:
+                # Extract text
+                extraction_result = document_service.extract_text_from_pdf(temp_path)
+                extracted_text = extraction_result["text"]
+                
+                # Perform OCR if needed
+                if extraction_result.get("requires_ocr") and ocr_service.is_available():
+                    logger.info("Performing OCR on scanned document")
+                    ocr_result = ocr_service.process_scanned_pdf(temp_path)
+                    extracted_text = ocr_result["text"]
+                    
+                    # Update document with OCR info
+                    document.ocr_performed = "yes"
+                    document.ocr_quality_score = ocr_result.get("quality_score")
+                
+                # Update document with extracted text
+                document.extracted_text = extracted_text
+                
+                # Generate explanation
+                if extracted_text and extracted_text.strip():
+                    explanation_result = document_service.explain_report(
+                        report_text=extracted_text,
+                        language=analysis.language,
+                    )
+                    
+                    # Save explanation
+                    result = AnalysisResult(
+                        analysis_id=analysis.id,
+                        result_type=ResultType.EXPLANATION,
+                        content={"explanation": explanation_result["explanation"]},
+                        model_name=explanation_result["model"],
+                    )
+                    db.add(result)
+                    
+                    # Try structured extraction
+                    structured = document_service.extract_structured_findings(
+                        report_text=extracted_text,
+                        language=analysis.language,
+                    )
+                    if structured:
+                        structured_result = AnalysisResult(
+                            analysis_id=analysis.id,
+                            result_type=ResultType.STRUCTURED_FINDINGS,
+                            content={"findings": structured},
+                        )
+                        db.add(structured_result)
+                
+                # Update analysis status
+                analysis.status = AnalysisStatus.COMPLETED
+                analysis.processing_completed_at = datetime.utcnow()
+                
+                db.commit()
+                
+                logger.info(f"Document processed successfully: {document_id}")
+            
+            finally:
+                # Clean up temp file
+                if temp_path.exists():
+                    temp_path.unlink()
+    
+    except Exception as e:
+        logger.error(f"Document processing failed: {str(e)}", exc_info=True)
+        raise self.retry(exc=e, countdown=60)
+
+
+@celery_app.task(bind=True, base=AnalysisTask, max_retries=3)
+def process_radiology_async(self, analysis_id: str, image_id: str):
+    """
+    Process radiology image asynchronously.
+    
+    Args:
+        analysis_id: Analysis ID
+        image_id: Image document ID
+    """
+    logger.info(f"Processing radiology image async: {image_id}")
+    
+    try:
+        with get_db_context() as db:
+            analysis = db.query(MedicalAnalysis).filter(
+                MedicalAnalysis.id == UUID(analysis_id)
+            ).first()
+            
+            if not analysis:
+                raise ValueError(f"Analysis not found: {analysis_id}")
+            
+            # Get image document
+            from backend.models.document import UploadedDocument
+            from backend.models.radiology import RadiologyFinding
+            
+            image = db.query(UploadedDocument).filter(
+                UploadedDocument.id == UUID(image_id)
+            ).first()
+            
+            if not image:
+                raise ValueError(f"Image not found: {image_id}")
+            
+            # Update analysis status
+            analysis.status = AnalysisStatus.PROCESSING
+            analysis.processing_started_at = datetime.utcnow()
+            db.commit()
+            
+            # Initialize services
+            storage_service = StorageService()
+            radiology_service = RadiologyService()
+            
+            # Retrieve image from storage
+            temp_path = storage_service.get_file(image.storage_key)
+            
+            try:
+                # Perform radiology analysis
+                analysis_result = radiology_service.analyze_chest_xray(temp_path)
+                
+                # Save findings
+                for finding_data in analysis_result["findings"]:
+                    finding = RadiologyFinding(
+                        analysis_id=analysis.id,
+                        finding_label=finding_data["label"],
+                        model_score=finding_data["model_score"],
+                        model_name=analysis_result["model_name"],
+                        model_version=analysis_result.get("model_version", "pretrained"),
+                        modality=analysis_result["modality"],
+                    )
+                    db.add(finding)
+                
+                # Save inference result
+                inference_result = AnalysisResult(
+                    analysis_id=analysis.id,
+                    result_type=ResultType.RADIOLOGY_INFERENCE,
+                    content={
+                        "modality": analysis_result["modality"],
+                        "model_name": analysis_result["model_name"],
+                        "findings": analysis_result["findings"],
+                        "disclaimer": analysis_result["disclaimer"],
+                    },
+                    model_name=analysis_result["model_name"],
+                )
+                db.add(inference_result)
+                
+                # Update analysis
+                analysis.analysis_type = AnalysisType.XRAY
+                analysis.status = AnalysisStatus.COMPLETED
+                analysis.processing_completed_at = datetime.utcnow()
+                analysis.processing_duration_seconds = str(analysis_result["processing_duration_seconds"])
+                
+                db.commit()
+                
+                logger.info(f"Radiology image processed successfully: {image_id}")
+            
+            finally:
+                # Clean up temp file
+                if temp_path.exists():
+                    temp_path.unlink()
+    
+    except Exception as e:
+        logger.error(f"Radiology processing failed: {str(e)}", exc_info=True)
+        raise self.retry(exc=e, countdown=60)
