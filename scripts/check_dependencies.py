@@ -1,212 +1,327 @@
+#!/usr/bin/env python3
 """
-Dependency and Environment Validation Script
+Check that all required dependencies are installed and available.
 
-Validates that all required dependencies and services are available.
+Run this script before starting ClaraMed to verify environment setup.
 """
 import sys
+import subprocess
 from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-from backend.core.config import settings
-from backend.core.logging import configure_logging, get_logger
-
-configure_logging()
-logger = get_logger(__name__)
 
 
 def check_python_version():
-    """Check Python version."""
-    import sys
+    """Verify Python version is 3.11+."""
+    print("Checking Python version...")
     version = sys.version_info
-    logger.info(f"Python version: {version.major}.{version.minor}.{version.micro}")
+    if version.major < 3 or (version.major == 3 and version.minor < 11):
+        print(f"  ❌ Python 3.11+ required, found {version.major}.{version.minor}")
+        return False
+    print(f"  ✓ Python {version.major}.{version.minor}.{version.micro}")
+    return True
+
+
+def check_package(package_name, import_name=None):
+    """Check if a Python package is installed."""
+    if import_name is None:
+        import_name = package_name
     
-    if version.major == 3 and version.minor >= 11:
-        logger.info("✓ Python version OK")
+    try:
+        __import__(import_name)
+        print(f"  ✓ {package_name}")
         return True
-    else:
-        logger.error("✗ Python 3.11+ required")
+    except ImportError:
+        print(f"  ❌ {package_name} not installed")
         return False
 
 
-def check_imports():
-    """Check critical package imports."""
-    checks = []
+def check_python_packages():
+    """Check all required Python packages."""
+    print("\nChecking Python packages...")
     
     packages = [
-        ("streamlit", "Streamlit"),
-        ("fastapi", "FastAPI"),
-        ("sqlalchemy", "SQLAlchemy"),
-        ("alembic", "Alembic"),
-        ("pydantic", "Pydantic"),
-        ("langchain", "LangChain"),
+        ("fastapi", "fastapi"),
+        ("uvicorn", "uvicorn"),
+        ("sqlalchemy", "sqlalchemy"),
+        ("alembic", "alembic"),
+        ("pydantic", "pydantic"),
+        ("psycopg2-binary", "psycopg2"),
+        ("celery", "celery"),
+        ("redis", "redis"),
+        ("torchxrayvision", "torchxrayvision"),
+        ("torch", "torch"),
+        ("pillow", "PIL"),
+        ("pytesseract", "pytesseract"),
         ("PyPDF2", "PyPDF2"),
-        ("PIL", "Pillow"),
-        ("torch", "PyTorch"),
-        ("torchvision", "TorchVision"),
-        ("torchxrayvision", "TorchXRayVision"),
-        ("celery", "Celery"),
-        ("redis", "Redis"),
+        ("langchain", "langchain"),
+        ("langchain-groq", "langchain_groq"),
+        ("streamlit", "streamlit"),
+        ("python-multipart", "multipart"),
+        ("python-dotenv", "dotenv"),
+        ("bcrypt", "bcrypt"),
     ]
     
-    for module, name in packages:
-        try:
-            __import__(module)
-            logger.info(f"✓ {name} available")
-            checks.append(True)
-        except ImportError as e:
-            logger.error(f"✗ {name} not available: {str(e)}")
-            checks.append(False)
+    all_ok = True
+    for package_name, import_name in packages:
+        if not check_package(package_name, import_name):
+            all_ok = False
     
-    return all(checks)
+    return all_ok
 
 
 def check_tesseract():
-    """Check Tesseract OCR availability."""
-    import subprocess
-    
+    """Check if Tesseract OCR is installed and accessible."""
+    print("\nChecking Tesseract OCR...")
     try:
         result = subprocess.run(
-            [settings.TESSERACT_CMD, "--version"],
+            ["tesseract", "--version"],
             capture_output=True,
             text=True,
             timeout=5
         )
         if result.returncode == 0:
             version_line = result.stdout.split('\n')[0]
-            logger.info(f"✓ Tesseract available: {version_line}")
+            print(f"  ✓ {version_line}")
             return True
         else:
-            logger.error("✗ Tesseract command failed")
+            print("  ❌ Tesseract command failed")
             return False
     except FileNotFoundError:
-        logger.error(f"✗ Tesseract not found at: {settings.TESSERACT_CMD}")
-        logger.info("  Install: https://github.com/tesseract-ocr/tesseract")
+        print("  ❌ Tesseract not found in PATH")
+        print("     Install from: https://github.com/tesseract-ocr/tesseract")
+        print("     Windows: Download installer from GitHub releases")
+        print("     Linux: sudo apt-get install tesseract-ocr")
+        print("     macOS: brew install tesseract")
         return False
     except Exception as e:
-        logger.error(f"✗ Tesseract check failed: {str(e)}")
+        print(f"  ❌ Error checking Tesseract: {e}")
         return False
 
 
-def check_database():
-    """Check database connectivity."""
-    try:
-        from backend.database.connection import engine
-        from sqlalchemy import text
-        
-        with engine.connect() as conn:
-            result = conn.execute(text("SELECT 1"))
-            result.fetchone()
-        
-        logger.info("✓ Database connection OK")
-        return True
-        
-    except Exception as e:
-        logger.error(f"✗ Database connection failed: {str(e)}")
-        logger.info(f"  Ensure PostgreSQL is running and DATABASE_URL is correct")
-        logger.info(f"  Current: {settings.DATABASE_URL}")
-        return False
-
-
-def check_redis():
-    """Check Redis connectivity."""
-    try:
-        import redis
-        r = redis.from_url(settings.REDIS_URL)
-        r.ping()
-        logger.info("✓ Redis connection OK")
-        return True
-        
-    except Exception as e:
-        logger.error(f"✗ Redis connection failed: {str(e)}")
-        logger.info(f"  Ensure Redis is running and REDIS_URL is correct")
-        logger.info(f"  Current: {settings.REDIS_URL}")
-        return False
-
-
-def check_groq_api_key():
-    """Check Groq API key configuration."""
-    if settings.GROQ_API_KEY and settings.GROQ_API_KEY != "your_groq_api_key_here":
-        logger.info("✓ GROQ_API_KEY configured")
-        return True
-    else:
-        logger.warning("⚠ GROQ_API_KEY not configured (LLM features will fail)")
-        return False
-
-
-def check_storage():
-    """Check storage configuration."""
-    if settings.STORAGE_PROVIDER == "local":
-        storage_path = Path(settings.STORAGE_LOCAL_PATH)
-        if not storage_path.exists():
-            logger.info(f"Creating local storage directory: {storage_path}")
-            storage_path.mkdir(parents=True, exist_ok=True)
-        
-        logger.info(f"✓ Local storage configured: {storage_path}")
-        return True
-    elif settings.STORAGE_PROVIDER == "s3":
-        if settings.STORAGE_ACCESS_KEY and settings.STORAGE_SECRET_KEY:
-            logger.info("✓ S3 storage credentials configured")
-            return True
-        else:
-            logger.error("✗ S3 storage selected but credentials missing")
-            return False
-    else:
-        logger.error(f"✗ Unknown storage provider: {settings.STORAGE_PROVIDER}")
-        return False
-
-
-def check_model_cache():
-    """Check model cache directory."""
-    cache_dir = Path(settings.RADIOLOGY_MODEL_CACHE_DIR)
-    if not cache_dir.exists():
-        logger.info(f"Creating model cache directory: {cache_dir}")
-        cache_dir.mkdir(parents=True, exist_ok=True)
+def check_environment_file():
+    """Check if .env file exists and has required variables."""
+    print("\nChecking environment configuration...")
     
-    logger.info(f"✓ Model cache directory: {cache_dir}")
+    env_path = Path(".env")
+    if not env_path.exists():
+        print("  ⚠️  .env file not found")
+        print("     Copy .env.example to .env and configure")
+        return False
+    
+    print("  ✓ .env file exists")
+    
+    # Check for critical variables
+    required_vars = [
+        "DATABASE_URL",
+        "GROQ_API_KEY",
+        "REDIS_URL",
+        "SECRET_KEY"
+    ]
+    
+    with open(env_path) as f:
+        env_content = f.read()
+    
+    missing_vars = []
+    for var in required_vars:
+        if f"{var}=" not in env_content or f"{var}=" in env_content and "your_" in env_content:
+            missing_vars.append(var)
+    
+    if missing_vars:
+        print(f"  ⚠️  Missing or unconfigured variables: {', '.join(missing_vars)}")
+        return False
+    
+    print("  ✓ Required environment variables present")
     return True
 
 
+def check_database_connection():
+    """Check if can connect to PostgreSQL database."""
+    print("\nChecking database connection...")
+    
+    try:
+        from dotenv import load_dotenv
+        import os
+        from sqlalchemy import create_engine
+        
+        load_dotenv()
+        database_url = os.getenv("DATABASE_URL")
+        
+        if not database_url:
+            print("  ⚠️  DATABASE_URL not set")
+            return False
+        
+        # Try to connect
+        engine = create_engine(database_url)
+        with engine.connect() as conn:
+            result = conn.execute("SELECT 1")
+            result.fetchone()
+        
+        print("  ✓ Database connection successful")
+        return True
+    
+    except Exception as e:
+        print(f"  ❌ Database connection failed: {e}")
+        print("     Ensure PostgreSQL is running and DATABASE_URL is correct")
+        return False
+
+
+def check_redis_connection():
+    """Check if can connect to Redis."""
+    print("\nChecking Redis connection...")
+    
+    try:
+        from dotenv import load_dotenv
+        import os
+        import redis
+        
+        load_dotenv()
+        redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+        
+        # Try to connect
+        r = redis.from_url(redis_url)
+        r.ping()
+        
+        print("  ✓ Redis connection successful")
+        return True
+    
+    except Exception as e:
+        print(f"  ❌ Redis connection failed: {e}")
+        print("     Ensure Redis is running and REDIS_URL is correct")
+        return False
+
+
+def check_storage_directory():
+    """Check if storage directory exists and is writable."""
+    print("\nChecking storage configuration...")
+    
+    try:
+        from dotenv import load_dotenv
+        import os
+        
+        load_dotenv()
+        storage_type = os.getenv("STORAGE_TYPE", "local")
+        
+        if storage_type == "local":
+            storage_path = Path(os.getenv("LOCAL_STORAGE_PATH", "./storage"))
+            
+            if not storage_path.exists():
+                print(f"  ⚠️  Storage directory {storage_path} does not exist")
+                print(f"     Creating...")
+                storage_path.mkdir(parents=True, exist_ok=True)
+            
+            # Check if writable
+            test_file = storage_path / ".write_test"
+            try:
+                test_file.write_text("test")
+                test_file.unlink()
+                print(f"  ✓ Storage directory writable: {storage_path.absolute()}")
+                return True
+            except Exception as e:
+                print(f"  ❌ Storage directory not writable: {e}")
+                return False
+        
+        elif storage_type == "s3":
+            print(f"  ✓ Using S3 storage (ensure AWS credentials configured)")
+            return True
+        
+        else:
+            print(f"  ⚠️  Unknown storage type: {storage_type}")
+            return False
+    
+    except Exception as e:
+        print(f"  ❌ Error checking storage: {e}")
+        return False
+
+
+def check_model_availability():
+    """Check if AI models can be loaded."""
+    print("\nChecking AI model availability...")
+    
+    # Check TorchXRayVision model
+    print("  Checking TorchXRayVision model...")
+    try:
+        import torchxrayvision as xrv
+        model = xrv.models.DenseNet(weights="densenet121-res224-all")
+        print("    ✓ TorchXRayVision model loaded")
+    except Exception as e:
+        print(f"    ⚠️  TorchXRayVision model load issue: {e}")
+        print("       Model will download on first use")
+    
+    # Check Groq API key
+    print("  Checking LLM API access...")
+    try:
+        from dotenv import load_dotenv
+        import os
+        
+        load_dotenv()
+        api_key = os.getenv("GROQ_API_KEY")
+        
+        if not api_key or api_key.startswith("your_"):
+            print("    ❌ GROQ_API_KEY not configured")
+            return False
+        
+        # Try a simple API call
+        from langchain_groq import ChatGroq
+        llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0.7)
+        response = llm.invoke("Say 'API working'")
+        
+        if response and "working" in response.content.lower():
+            print("    ✓ Groq API accessible")
+            return True
+        else:
+            print("    ⚠️  Unexpected API response")
+            return False
+    
+    except Exception as e:
+        print(f"    ❌ LLM API check failed: {e}")
+        return False
+
+
 def main():
-    """Run all checks."""
-    logger.info("=" * 60)
-    logger.info("ClaraMed Dependency and Environment Validation")
-    logger.info("=" * 60)
+    """Run all dependency checks."""
+    print("=" * 60)
+    print("ClaraMed Dependency Check")
+    print("=" * 60)
     
-    checks = {
-        "Python Version": check_python_version(),
-        "Package Imports": check_imports(),
-        "Tesseract OCR": check_tesseract(),
-        "PostgreSQL Database": check_database(),
-        "Redis": check_redis(),
-        "Groq API Key": check_groq_api_key(),
-        "Storage Configuration": check_storage(),
-        "Model Cache": check_model_cache(),
-    }
+    checks = [
+        check_python_version(),
+        check_python_packages(),
+        check_tesseract(),
+        check_environment_file(),
+    ]
     
-    logger.info("=" * 60)
-    logger.info("Validation Summary")
-    logger.info("=" * 60)
+    # Optional checks (won't fail overall if these fail)
+    optional_checks = [
+        check_database_connection(),
+        check_redis_connection(),
+        check_storage_directory(),
+        check_model_availability(),
+    ]
     
-    for check_name, passed in checks.items():
-        status = "✓ PASS" if passed else "✗ FAIL"
-        logger.info(f"{status}: {check_name}")
+    print("\n" + "=" * 60)
     
-    logger.info("=" * 60)
-    
-    # Count critical vs non-critical failures
-    critical_checks = ["Python Version", "Package Imports", "PostgreSQL Database"]
-    critical_passed = all(checks[name] for name in critical_checks if name in checks)
-    
-    if critical_passed:
-        logger.info("✓ All critical checks passed")
-        logger.info("  Application can start (some features may be limited)")
-        return 0
+    if all(checks):
+        print("✓ All required dependencies satisfied")
+        
+        if all(optional_checks):
+            print("✓ All services accessible and ready")
+            print("\nYou can start ClaraMed with:")
+            print("  docker-compose up")
+            print("  or")
+            print("  uvicorn backend.main:app --reload")
+            sys.exit(0)
+        else:
+            print("⚠️  Some services need configuration")
+            print("\nReview warnings above and start required services:")
+            print("  - PostgreSQL database")
+            print("  - Redis server")
+            print("  - Configure .env file")
+            sys.exit(1)
     else:
-        logger.error("✗ Critical checks failed")
-        logger.error("  Fix critical issues before starting the application")
-        return 1
+        print("❌ Missing required dependencies")
+        print("\nInstall missing packages:")
+        print("  pip install -r requirements.txt")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
