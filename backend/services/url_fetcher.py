@@ -89,7 +89,8 @@ def _validate(url: str, allowed_hosts: list[str], resolver) -> None:
         raise FetchError("blocked_address", "host resolves to a non-public address")
 
 
-def _detect(content: bytes, kind: str) -> tuple[str, str]:
+def detect_file(content: bytes, kind: str) -> tuple[str, str]:
+    """Return (detected type, extension) if `content` is a valid file of `kind`, else raise FetchError('bad_content')."""
     for magic, name, ext in _MAGIC:
         if content.startswith(magic):
             if name in _ALLOWED[kind]:
@@ -150,7 +151,7 @@ def fetch_file(
             if redirect_to is not None:
                 current = urljoin(current, redirect_to)
                 continue
-            name, ext = _detect(bytes(buffer), kind)
+            name, ext = detect_file(bytes(buffer), kind)
             return FetchedFile(content=bytes(buffer), kind_detected=name, extension=ext)
         raise FetchError("redirect_limit", "too many redirects")
     finally:

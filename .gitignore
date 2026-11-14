@@ -7,3 +7,4 @@ venv/
 test.db
 backups/
 .env.production
+claramed.db

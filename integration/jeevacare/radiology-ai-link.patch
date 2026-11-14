@@ -1,0 +1,226 @@
+diff --git a/client/.env.example b/client/.env.example
+index ef51a4b..056e1d7 100644
+--- a/client/.env.example
++++ b/client/.env.example
+@@ -12,3 +12,5 @@ VITE_API_BASE_URL=http://localhost:5000/api/v1
+ # Optional API timeout (ms)
+ VITE_API_TIMEOUT=30000
+ 
++# ClaraMed (separate AI website). Adds a "Radiology AI" link to the sidebar when set (https, or localhost for development).
++# VITE_CLARAMED_BASE_URL=https://your-claramed-app.streamlit.app
+diff --git a/client/src/components/Sidebar.jsx b/client/src/components/Sidebar.jsx
+index c50e260..815cf24 100644
+--- a/client/src/components/Sidebar.jsx
++++ b/client/src/components/Sidebar.jsx
+@@ -1,8 +1,12 @@
+ import React, { useState } from 'react';
+ import { Link, useLocation } from 'react-router-dom';
+ import { useAuthStore } from '../stores/authStore';
+-import { Home, Users, Stethoscope, Calendar, AlertCircle, FileText, ChevronDown, X, Activity } from 'lucide-react';
++import { Home, Users, Stethoscope, Calendar, AlertCircle, FileText, ChevronDown, X, Activity, ExternalLink } from 'lucide-react';
+ import Logo from './Logo';
++import { claraMedConfig } from '../config/claramed';
++
++// Roles that see the link to the separate ClaraMed "Radiology AI" website.
++const RADIOLOGY_AI_ROLES = ['PATIENT', 'DOCTOR', 'RADIOLOGY_TECHNICIAN'];
+ 
+ export default function Sidebar({ isOpen = true, onClose }) {
+   const { user } = useAuthStore();
+@@ -54,7 +58,12 @@ export default function Sidebar({ isOpen = true, onClose }) {
+     ],
+   };
+ 
+-  const items = menuItems[user?.role] || [];
++  const roleItems = menuItems[user?.role] || [];
++  const radiologyAiUrl = RADIOLOGY_AI_ROLES.includes(user?.role) ? claraMedConfig.getRadiologyAiUrl() : null;
++  // ClaraMed is a separate site: this item is an external link, not a route in this app.
++  const items = radiologyAiUrl
++    ? [...roleItems, { name: 'Radiology AI', href: radiologyAiUrl, icon: Activity, external: true }]
++    : roleItems;
+   const isActive = (path) => location.pathname === path;
+ 
+   // Close sidebar on mobile when a link is clicked
+@@ -103,14 +112,33 @@ export default function Sidebar({ isOpen = true, onClose }) {
+         <nav className="space-y-2 flex-1">
+           {items.map((item) => {
+             const Icon = item.icon;
+-            const active = isActive(item.path);
++            const linkClasses =
++              'flex items-center gap-3 px-4 py-3 rounded-lg transition-all duration-200 text-sm font-medium focus-visible:outline-offset-2';
+ 
++            if (item.external) {
++              return (
++                <a
++                  key={item.href}
++                  href={item.href}
++                  target="_blank"
++                  rel="noopener noreferrer"
++                  onClick={handleLinkClick}
++                  className={`${linkClasses} text-gray-300 hover:bg-white/10 hover:text-white`}
++                >
++                  <Icon size={18} className="flex-shrink-0" />
++                  <span>{item.name}</span>
++                  <ExternalLink size={14} className="ml-auto flex-shrink-0 opacity-70" aria-hidden="true" />
++                </a>
++              );
++            }
++
++            const active = isActive(item.path);
+             return (
+               <Link
+                 key={item.path}
+                 to={item.path}
+                 onClick={handleLinkClick}
+-                className={`flex items-center gap-3 px-4 py-3 rounded-lg transition-all duration-200 text-sm font-medium focus-visible:outline-offset-2 ${
++                className={`${linkClasses} ${
+                   active
+                     ? 'bg-jeevacare-blue text-white shadow-lg'
+                     : 'text-gray-300 hover:bg-white/10 hover:text-white'
+diff --git a/client/src/components/Sidebar.test.jsx b/client/src/components/Sidebar.test.jsx
+new file mode 100644
+index 0000000..7d44f44
+--- /dev/null
++++ b/client/src/components/Sidebar.test.jsx
+@@ -0,0 +1,49 @@
++import React from 'react';
++import { afterEach, describe, expect, it, vi } from 'vitest';
++import { renderToStaticMarkup } from 'react-dom/server';
++import { MemoryRouter } from 'react-router-dom';
++import Sidebar from './Sidebar';
++
++// renderToStaticMarkup reads a zustand store's INITIAL state, so the signed-in user is supplied through a mock.
++const session = vi.hoisted(() => ({ user: null }));
++vi.mock('../stores/authStore', () => ({ useAuthStore: () => ({ user: session.user }) }));
++
++const BASE = 'https://claramed.streamlit.app';
++
++function render(role) {
++  session.user = { role, profile: { firstName: 'A', lastName: 'B' } };
++  return renderToStaticMarkup(
++    <MemoryRouter>
++      <Sidebar isOpen onClose={() => {}} />
++    </MemoryRouter>
++  );
++}
++
++afterEach(() => vi.unstubAllEnvs());
++
++describe('Sidebar Radiology AI link', () => {
++  it.each(['PATIENT', 'DOCTOR', 'RADIOLOGY_TECHNICIAN'])('opens ClaraMed in a new tab for %s', (role) => {
++    vi.stubEnv('VITE_CLARAMED_BASE_URL', BASE);
++    const html = render(role);
++    expect(html).toContain('Radiology AI');
++    expect(html).toContain(`href="${BASE}/Radiology_AI"`);
++    expect(html).toContain('target="_blank"');
++    expect(html).toContain('rel="noopener noreferrer"');
++  });
++
++  it('is hidden when ClaraMed is not configured', () => {
++    vi.stubEnv('VITE_CLARAMED_BASE_URL', '');
++    expect(render('PATIENT')).not.toContain('Radiology AI');
++  });
++
++  it('is hidden for roles without radiology access', () => {
++    vi.stubEnv('VITE_CLARAMED_BASE_URL', BASE);
++    expect(render('HOSPITAL_ADMIN')).not.toContain('Radiology AI');
++    expect(render('SYSTEM_ADMIN')).not.toContain('Radiology AI');
++  });
++
++  it('keeps the existing in-app Radiology & Imaging page for patients', () => {
++    vi.stubEnv('VITE_CLARAMED_BASE_URL', BASE);
++    expect(render('PATIENT')).toContain('href="/radiology"');
++  });
++});
+diff --git a/client/src/config/claramed.js b/client/src/config/claramed.js
+index cd2fe77..5acf095 100644
+--- a/client/src/config/claramed.js
++++ b/client/src/config/claramed.js
+@@ -22,17 +22,33 @@ export const claraMedConfig = {
+   },
+ 
+   /**
+-   * Get ClaraMed analysis URL for a radiology record
+-   * @param {string} radiologyId - JeevaCare radiology record ID
+-   * @param {string} patientId - JeevaCare patient ID
+-   * @returns {string} Full ClaraMed analysis URL
++   * URL of ClaraMed's "Radiology AI" page, or null when ClaraMed is not configured.
++   * ClaraMed is a separate website; this is a plain link, so nothing about the user or a record is sent.
++   * Read at call time (not cached) so tests and runtime config changes take effect.
++   * Only https is accepted (http is allowed for localhost during development).
++   * @returns {string|null}
+    */
+-  getAnalysisUrl(radiologyId, patientId) {
+-    if (!this.isConfigured()) {
++  getRadiologyAiUrl() {
++    const base = (import.meta.env.VITE_CLARAMED_BASE_URL || '').trim().replace(/\/+$/, '');
++    if (!base) return null;
++    let parsed;
++    try {
++      parsed = new URL(base);
++    } catch {
+       return null;
+     }
+-    // Future: Will include auth token and callback URL
+-    return `${this.baseUrl}/analyze?record=${radiologyId}&patient=${patientId}`;
++    const isLocalhost = parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1';
++    if (parsed.protocol !== 'https:' && !(parsed.protocol === 'http:' && isLocalhost)) return null;
++    return `${base}/Radiology_AI`;
++  },
++
++  /**
++   * Kept for existing callers (RadiologyPage). ClaraMed no longer receives record or patient ids:
++   * it is a separate service reached by a plain link, so this returns the same Radiology AI page URL.
++   * @returns {string|null}
++   */
++  getAnalysisUrl() {
++    return this.getRadiologyAiUrl();
+   },
+ 
+   /**
+diff --git a/client/src/config/claramed.test.js b/client/src/config/claramed.test.js
+new file mode 100644
+index 0000000..4b3ebd2
+--- /dev/null
++++ b/client/src/config/claramed.test.js
+@@ -0,0 +1,41 @@
++import { afterEach, describe, expect, it, vi } from 'vitest';
++import { claraMedConfig } from './claramed';
++
++afterEach(() => vi.unstubAllEnvs());
++
++describe('claraMedConfig.getRadiologyAiUrl', () => {
++  it('builds the page URL from the base URL', () => {
++    vi.stubEnv('VITE_CLARAMED_BASE_URL', 'https://claramed.streamlit.app');
++    expect(claraMedConfig.getRadiologyAiUrl()).toBe('https://claramed.streamlit.app/Radiology_AI');
++  });
++
++  it('strips trailing slashes', () => {
++    vi.stubEnv('VITE_CLARAMED_BASE_URL', 'https://claramed.streamlit.app//');
++    expect(claraMedConfig.getRadiologyAiUrl()).toBe('https://claramed.streamlit.app/Radiology_AI');
++  });
++
++  it('is null when the variable is unset or blank', () => {
++    vi.stubEnv('VITE_CLARAMED_BASE_URL', '');
++    expect(claraMedConfig.getRadiologyAiUrl()).toBeNull();
++    vi.stubEnv('VITE_CLARAMED_BASE_URL', '   ');
++    expect(claraMedConfig.getRadiologyAiUrl()).toBeNull();
++  });
++
++  it('refuses non-https URLs except localhost for development', () => {
++    vi.stubEnv('VITE_CLARAMED_BASE_URL', 'http://claramed.example.com');
++    expect(claraMedConfig.getRadiologyAiUrl()).toBeNull();
++    vi.stubEnv('VITE_CLARAMED_BASE_URL', 'javascript:alert(1)');
++    expect(claraMedConfig.getRadiologyAiUrl()).toBeNull();
++    vi.stubEnv('VITE_CLARAMED_BASE_URL', 'not a url');
++    expect(claraMedConfig.getRadiologyAiUrl()).toBeNull();
++    vi.stubEnv('VITE_CLARAMED_BASE_URL', 'http://localhost:8501');
++    expect(claraMedConfig.getRadiologyAiUrl()).toBe('http://localhost:8501/Radiology_AI');
++  });
++
++  it('getAnalysisUrl sends no patient or record ids', () => {
++    vi.stubEnv('VITE_CLARAMED_BASE_URL', 'https://claramed.streamlit.app');
++    const url = claraMedConfig.getAnalysisUrl('rad-123', 'patient-456');
++    expect(url).toBe('https://claramed.streamlit.app/Radiology_AI');
++    expect(url).not.toMatch(/rad-123|patient-456/);
++  });
++});
