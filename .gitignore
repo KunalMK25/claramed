@@ -3,3 +3,5 @@
 __pycache__/
 *.pyc
 claramd.db
+venv/
+test.db

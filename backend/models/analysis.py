@@ -4,7 +4,7 @@ Medical Analysis Model
 import enum
 import uuid
 from datetime import datetime
-from sqlalchemy import Column, String, DateTime, Boolean, Enum, Text, JSON
+from sqlalchemy import Column, String, DateTime, Boolean, Enum, Text, JSON, Integer, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 from backend.database.connection import Base
@@ -26,11 +26,31 @@ class AnalysisStatus(str, enum.Enum):
     FAILED = "failed"
 
 
+class DeliveryStatus:
+    """Values of MedicalAnalysis.delivery_status (a plain string column)."""
+    PENDING = "pending"
+    DELIVERED = "delivered"
+    FAILED = "failed"      # callback retries exhausted; results are still pollable
+    SKIPPED = "skipped"    # client has no webhook or was deactivated
+
+
+class RecordKind:
+    """Values of MedicalAnalysis.external_record_kind (a plain string column)."""
+    RADIOLOGY = "radiology"
+    DOCUMENT = "document"
+
+
 class MedicalAnalysis(Base):
     """Medical analysis record."""
     
     __tablename__ = "medical_analyses"
-    
+    __table_args__ = (
+        UniqueConstraint(
+            "requesting_client_id", "external_record_kind", "external_record_id",
+            name="uq_analysis_client_record",
+        ),
+    )
+
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     analysis_type = Column(Enum(AnalysisType), nullable=False, index=True)
     status = Column(Enum(AnalysisStatus), default=AnalysisStatus.PENDING, nullable=False, index=True)
@@ -48,7 +68,16 @@ class MedicalAnalysis(Base):
     # Request metadata
     requesting_client_id = Column(UUID(as_uuid=True), nullable=True, index=True)
     request_id = Column(String(100), nullable=True, index=True)
-    
+
+    # Integration: client-supplied record (idempotency) and callback state
+    external_record_id = Column(String(255), nullable=True)
+    external_record_kind = Column(String(20), nullable=True)  # see RecordKind
+    delivery_status = Column(String(20), nullable=True)  # see DeliveryStatus
+    delivery_attempts = Column(Integer, default=0, nullable=False, server_default="0")
+    delivery_last_error = Column(String(500), nullable=True)
+    callback_delivered_at = Column(DateTime, nullable=True)
+    results_expire_at = Column(DateTime, nullable=True, index=True)
+
     # Emergency classification
     emergency_flagged = Column(Boolean, default=False, nullable=False)
     emergency_message = Column(Text, nullable=True)

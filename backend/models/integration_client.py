@@ -33,6 +33,12 @@ class IntegrationClient(Base):
     rate_limit_per_minute = Column(String(10), nullable=True)
     rate_limit_per_hour = Column(String(10), nullable=True)
     
+    # Integration callback configuration (see docs/CLARAMED_API.md)
+    webhook_url = Column(String(500), nullable=True)
+    webhook_secret = Column(String(128), nullable=True)
+    callback_auth_token = Column(String(255), nullable=True)
+    allowed_file_hosts = Column(ARRAY(String), default=list, nullable=False, server_default="{}")
+
     # Timestamps
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     last_used_at = Column(DateTime, nullable=True)

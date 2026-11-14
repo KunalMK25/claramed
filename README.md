@@ -254,7 +254,8 @@ ClaraMed is designed for future integration with JeevaCare healthcare platform w
 - Service-to-service authentication
 - Webhook notifications (optional)
 
-See [BUILD.md](BUILD.md) for integration specifications.
+See [docs/CLARAMED_API.md](docs/CLARAMED_API.md) for the client integration contract (submit, status, signed callbacks)
+and [BUILD.md](BUILD.md) for the original specification.
 
 ---
 

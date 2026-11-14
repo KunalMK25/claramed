@@ -10,14 +10,17 @@ import streamlit as st
 
 # Get backend URL from environment or use default
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
+API_KEY = os.getenv("CLARAMED_API_KEY")
 
 
 class ClaraMedAPIClient:
     """Client for ClaraMed backend API."""
     
-    def __init__(self, base_url: str = BACKEND_URL):
+    def __init__(self, base_url: str = BACKEND_URL, api_key: Optional[str] = API_KEY):
         self.base_url = base_url.rstrip("/")
         self.session = requests.Session()
+        if api_key:
+            self.session.headers["Authorization"] = f"Bearer {api_key}"
     
     def health_check(self) -> Dict[str, Any]:
         """Check API health."""

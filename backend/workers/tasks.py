@@ -7,12 +7,13 @@ from celery import Task
 from backend.workers.celery_app import celery_app
 from backend.core.logging import get_logger
 from backend.database.connection import get_db_context
-from backend.models.analysis import MedicalAnalysis, AnalysisStatus
+from backend.models.analysis import MedicalAnalysis, AnalysisStatus, AnalysisType
 from backend.models.result import AnalysisResult, ResultType
 from backend.services.document_service import DocumentService
 from backend.services.ocr_service import OCRService
 from backend.services.radiology_service import RadiologyService
 from backend.services.storage_service import StorageService
+from backend.core.exceptions import CorruptDocumentError, ValidationError
 from pathlib import Path
 from uuid import UUID
 from datetime import datetime
@@ -20,8 +21,27 @@ from datetime import datetime
 logger = get_logger(__name__)
 
 
+class NonRetryableError(Exception):
+    """Deterministic bad input (corrupt image or PDF). Fail now; retrying cannot help."""
+
+
+def finalize_after_task(analysis_id: str) -> None:
+    """Integration lifecycle (delete source file, start retention, queue callback). Never raises."""
+    try:
+        from backend.workers.callbacks import finalize_integration_analysis  # lazy: avoids an import cycle
+        with get_db_context() as db:
+            finalize_integration_analysis(db, analysis_id)
+    except Exception as exc:
+        logger.error(f"Finalization failed: {exc}", analysis_id=analysis_id)
+
+
 class AnalysisTask(Task):
     """Base task for analysis operations."""
+    
+    def on_success(self, retval, task_id, args, kwargs):
+        """Finalize integration analyses once the work has completed."""
+        if args:
+            finalize_after_task(args[0])
     
     def on_failure(self, exc, task_id, args, kwargs, einfo):
         """Handle task failure."""
@@ -48,6 +68,7 @@ class AnalysisTask(Task):
                         db.commit()
             except Exception as e:
                 logger.error(f"Failed to update analysis status: {str(e)}")
+            finalize_after_task(analysis_id)
 
 
 @celery_app.task(bind=True, base=AnalysisTask, max_retries=3)
@@ -69,6 +90,11 @@ def process_document_async(self, analysis_id: str, document_id: str):
             
             if not analysis:
                 raise ValueError(f"Analysis not found: {analysis_id}")
+            
+            if analysis.status == AnalysisStatus.FAILED:
+                # Swept as stale (or failed earlier): a late worker must not overwrite that outcome.
+                logger.info(f"Skipping already-failed analysis: {analysis_id}")
+                return
             
             # Get document
             from backend.models.document import UploadedDocument
@@ -94,7 +120,10 @@ def process_document_async(self, analysis_id: str, document_id: str):
             
             try:
                 # Extract text
-                extraction_result = document_service.extract_text_from_pdf(temp_path)
+                try:
+                    extraction_result = document_service.extract_text_from_pdf(temp_path)
+                except (ValidationError, CorruptDocumentError) as exc:
+                    raise NonRetryableError(str(exc)) from exc
                 extracted_text = extraction_result["text"]
                 
                 # Perform OCR if needed
@@ -152,6 +181,8 @@ def process_document_async(self, analysis_id: str, document_id: str):
                 if temp_path.exists():
                     temp_path.unlink()
     
+    except NonRetryableError:
+        raise  # AnalysisTask.on_failure marks the analysis failed and finalizes it immediately
     except Exception as e:
         logger.error(f"Document processing failed: {str(e)}", exc_info=True)
         raise self.retry(exc=e, countdown=60)
@@ -176,6 +207,11 @@ def process_radiology_async(self, analysis_id: str, image_id: str):
             
             if not analysis:
                 raise ValueError(f"Analysis not found: {analysis_id}")
+            
+            if analysis.status == AnalysisStatus.FAILED:
+                # Swept as stale (or failed earlier): a late worker must not overwrite that outcome.
+                logger.info(f"Skipping already-failed analysis: {analysis_id}")
+                return
             
             # Get image document
             from backend.models.document import UploadedDocument
@@ -202,7 +238,10 @@ def process_radiology_async(self, analysis_id: str, image_id: str):
             
             try:
                 # Perform radiology analysis
-                analysis_result = radiology_service.analyze_chest_xray(temp_path)
+                try:
+                    analysis_result = radiology_service.analyze_chest_xray(temp_path)
+                except ValidationError as exc:
+                    raise NonRetryableError(str(exc)) from exc
                 
                 # Save findings
                 for finding_data in analysis_result["findings"]:
@@ -245,6 +284,8 @@ def process_radiology_async(self, analysis_id: str, image_id: str):
                 if temp_path.exists():
                     temp_path.unlink()
     
+    except NonRetryableError:
+        raise
     except Exception as e:
         logger.error(f"Radiology processing failed: {str(e)}", exc_info=True)
         raise self.retry(exc=e, countdown=60)

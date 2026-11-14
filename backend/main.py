@@ -11,10 +11,10 @@ from contextlib import asynccontextmanager
 import time
 import uuid
 
-from backend.core.config import settings
+from backend.core.config import settings, storage_topology_warning
 from backend.core.logging import configure_logging, get_logger
 from backend.core.exceptions import ClaraMedException
-from backend.api.routes import health, analyses
+from backend.api.routes import health, analyses, integration
 
 # Configure logging
 configure_logging()
@@ -29,6 +29,10 @@ async def lifespan(app: FastAPI):
     logger.info(f"Starting {settings.APP_NAME} v{settings.APP_VERSION}")
     logger.info(f"Environment: {settings.APP_ENV}")
     logger.info("=" * 60)
+    
+    topology = storage_topology_warning(settings.APP_ENV, settings.STORAGE_PROVIDER)
+    if topology:
+        logger.warning(topology)
     
     # Validate configuration
     missing = settings.validate_required_settings()
@@ -117,12 +121,25 @@ async def claramed_exception_handler(request: Request, exc: ClaraMedException):
     )
 
 
+def _safe_validation_errors(errors) -> list:
+    """JSON-safe validation errors without echoing request input (which may contain patient data)."""
+    safe = []
+    for err in errors:
+        item = {k: v for k, v in err.items() if k not in ("input", "ctx", "url")}
+        item["loc"] = [str(part) for part in err.get("loc", ())]
+        if err.get("ctx"):
+            item["ctx"] = {k: str(v) for k, v in err["ctx"].items()}
+        safe.append(item)
+    return safe
+
+
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     """Handle Pydantic validation errors."""
+    details = _safe_validation_errors(exc.errors())
     logger.warning(
         "Validation error",
-        errors=exc.errors(),
+        errors=details,
         request_id=getattr(request.state, "request_id", None),
     )
     
@@ -131,7 +148,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
         content={
             "error": {
                 "message": "Validation error",
-                "details": exc.errors(),
+                "details": details,
                 "request_id": getattr(request.state, "request_id", None),
             }
         },
@@ -162,6 +179,7 @@ async def general_exception_handler(request: Request, exc: Exception):
 # Include routers
 app.include_router(health.router, prefix="/api/v1", tags=["Health"])
 app.include_router(analyses.router, prefix="/api/v1", tags=["Analyses"])
+app.include_router(integration.router, prefix="/api/v1", tags=["Integration"])
 
 
 # Root endpoint

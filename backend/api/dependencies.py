@@ -3,19 +3,22 @@ API Dependencies
 
 Dependency injection functions for FastAPI routes.
 """
+from datetime import datetime, timedelta
 from typing import Optional
 from fastapi import Depends, Header, HTTPException, status
 from sqlalchemy.orm import Session
 
 from backend.database.connection import get_db
 from backend.models.integration_client import IntegrationClient
-from backend.core.security import verify_api_key
+from backend.core.security import hash_api_key
 from backend.core.logging import get_logger
 
 logger = get_logger(__name__)
 
+LAST_USED_WRITE_INTERVAL = timedelta(seconds=60)
 
-async def get_current_client(
+
+def get_current_client(
     authorization: Optional[str] = Header(None),
     db: Session = Depends(get_db),
 ) -> Optional[IntegrationClient]:
@@ -34,24 +37,21 @@ async def get_current_client(
             detail="Invalid authorization header format",
         )
     
-    api_key = authorization.replace("Bearer ", "")
+    api_key = authorization[len("Bearer "):].strip()
     
-    # Query all active clients
-    clients = db.query(IntegrationClient).filter(
-        IntegrationClient.active == True
-    ).all()
+    # hashed_api_key is unique and indexed: one lookup, no scan over all clients.
+    client = db.query(IntegrationClient).filter(
+        IntegrationClient.hashed_api_key == hash_api_key(api_key),
+        IntegrationClient.active == True,
+    ).first()
     
-    # Verify API key against each client
-    for client in clients:
-        if verify_api_key(api_key, client.hashed_api_key):
-            logger.info(f"Client authenticated: {client.client_name}")
-            
-            # Update last used timestamp
-            from datetime import datetime
-            client.last_used_at = datetime.utcnow()
+    if client is not None:
+        now = datetime.utcnow()
+        # Throttle the write: at most one last_used_at update per minute per client.
+        if client.last_used_at is None or now - client.last_used_at > LAST_USED_WRITE_INTERVAL:
+            client.last_used_at = now
             db.commit()
-            
-            return client
+        return client
     
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,

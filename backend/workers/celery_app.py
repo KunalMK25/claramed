@@ -55,7 +55,20 @@ celery_app.conf.update(
     redis_socket_connect_timeout=5,
 )
 
-# Auto-discover tasks
+# Periodic maintenance (run with: celery -A backend.workers.celery_app beat)
+celery_app.conf.beat_schedule = {
+    "purge-expired-results": {
+        "task": "backend.workers.callbacks.purge_expired_results",
+        "schedule": 3600.0,
+    },
+    "sweep-stale-jobs": {
+        "task": "backend.workers.callbacks.sweep_stale_jobs_task",
+        "schedule": 600.0,
+    },
+}
+
+# Auto-discover tasks (tasks.py by default, plus callbacks.py)
 celery_app.autodiscover_tasks(["backend.workers"])
+celery_app.autodiscover_tasks(["backend.workers"], related_name="callbacks")
 
 logger.info("Celery app configured")

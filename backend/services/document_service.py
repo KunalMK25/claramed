@@ -11,7 +11,7 @@ import PyPDF2
 from backend.ai.llm_provider import get_llm_provider
 from backend.ai.prompts import REPORT_EXPLAINER_PROMPT, STRUCTURED_FINDINGS_PROMPT
 from backend.core.logging import get_logger
-from backend.core.exceptions import ProcessingError, ValidationError
+from backend.core.exceptions import ProcessingError, ValidationError, CorruptDocumentError
 
 logger = get_logger(__name__)
 
@@ -102,7 +102,7 @@ class DocumentService:
         
         except PyPDF2.errors.PdfReadError as e:
             logger.error(f"PDF read error: {str(e)}")
-            raise ProcessingError(
+            raise CorruptDocumentError(
                 f"Invalid or corrupted PDF: {str(e)}",
                 details={"file": file_path.name}
             )

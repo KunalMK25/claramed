@@ -1,0 +1,2724 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>JeevaCare Linking Backend Implementation Plan</title>
+<style>
+  body { font: 15px/1.55 -apple-system, "Segoe UI", sans-serif; max-width: 800px; margin: 2rem auto; padding: 0 1rem; color: #1b1f24; }
+  h1 { font-size: 1.7rem; margin-bottom: .2rem; }
+  h2 { margin-top: 2.2rem; border-bottom: 1px solid #d0d7de; padding-bottom: .25rem; }
+  h3 { margin-top: 1.8rem; }
+  .lede { color: #57606a; margin-top: 0; }
+  table { border-collapse: collapse; width: 100%; margin: .8rem 0; font-size: .92rem; }
+  th, td { border: 1px solid #d0d7de; padding: .35rem .5rem; text-align: left; vertical-align: top; }
+  th { background: #f6f8fa; }
+  pre { background: #f6f8fa; padding: .7rem; overflow-x: auto; font-size: .82rem; border-radius: 6px; }
+  code { font-family: ui-monospace, Menlo, monospace; font-size: .88em; }
+  .task { border: 1px solid #d0d7de; border-radius: 8px; padding: .2rem 1rem 1rem; margin: 1.4rem 0; }
+  .meta { background: #fff8c5; padding: .4rem .7rem; border-radius: 6px; font-size: .9rem; }
+  .step { margin: .9rem 0 .2rem; font-weight: 600; }
+  blockquote { border-left: 4px solid #d0d7de; margin: 1rem 0; padding: .1rem 1rem; color: #57606a; }
+</style>
+</head>
+<body>
+
+<h1>JeevaCare Linking Backend Implementation Plan</h1>
+<p class="lede">Make ClaraMed callable by JeevaCare through the contract in JeevaCare's own integration guide: authenticated submit, status, and a signed, retried callback.</p>
+
+<blockquote>
+<strong>For agentic workers:</strong> REQUIRED SUB-SKILL: Use <code>subagent-driven-development</code> (recommended) or <code>executing-plans</code> to implement this plan task-by-task. Each task's implementation goes through <code>test-driven-development</code>, which is mandatory in this repo. Steps use checkbox (<code>- [ ]</code>) syntax for tracking.
+</blockquote>
+
+<p><strong>Goal:</strong> ClaraMed accepts radiology and document analysis requests from a registered client (JeevaCare first), processes them with the existing Celery workers, and pushes HMAC-signed results to the client's webhook with retries.</p>
+<p><strong>Architecture:</strong> A thin integration layer (<code>/api/v1/analyze</code>, <code>/api/v1/status/{jobId}</code>) over the existing analysis models and Celery tasks. Per-client settings (webhook URL, secret, allowed file hosts) live on <code>IntegrationClient</code>. A finalizer deletes source files and schedules the callback; a dispatcher signs and delivers it.</p>
+<p><strong>Tech Stack:</strong> Python 3.11, FastAPI, SQLAlchemy 2 + Alembic, PostgreSQL 16, Celery + Redis, httpx, pytest. Spec: <code>.slash-cli/specs/2026-11-14-jeevacare-linking-design.md</code>.</p>
+
+<h2>Global Constraints</h2>
+<ul>
+  <li>ClaraMed side only: no edits to the JeevaCare repo (<code>siri05gowda-byte/Jeevacare</code>).</li>
+  <li>File URLs: HTTPS only, host in the client's allowlist, resolved IP public, size ≤ <code>MAX_UPLOAD_SIZE_MB</code> (default 10), content type must match <code>type</code>.</li>
+  <li>Callback header: <code>X-ClaraMed-Signature: sha256=&lt;HMAC(secret, timestamp + "." + body)&gt;</code> plus <code>X-ClaraMed-Timestamp</code>.</li>
+  <li>Callback retries: up to 5 attempts, exponential backoff over about 30 minutes, then <code>delivery_status="failed"</code>.</li>
+  <li>Source file deleted after analysis finishes; results kept <code>RESULT_RETENTION_DAYS</code> (default 30).</li>
+  <li>Patient name and date of birth are never accepted in URLs or query strings; logs carry opaque IDs only.</li>
+  <li>Python 3.11 (venv at <code>./venv</code>); run tests with <code>source venv/bin/activate &amp;&amp; python -m pytest</code>.</li>
+  <li>DB driver stays <code>postgresql+psycopg2</code> (pinned in <code>backend/core/config.py</code>).</li>
+</ul>
+
+<h2>Deviations</h2>
+<table>
+<tr><th>ID</th><th>Deviation from spec / JeevaCare doc</th><th>Why</th></tr>
+<tr><td>D1</td><td>Endpoints are <code>/api/v1/analyze</code> and <code>/api/v1/status/{jobId}</code>, not root-level. JeevaCare sets <code>CLARAMED_API_URL</code> to <code>https://host/api/v1</code>.</td><td>The existing app is versioned under <code>/api/v1</code>.</td></tr>
+<tr><td>D2</td><td>JeevaCare's doc lists <code>POST /callback</code> under ClaraMed endpoints, but it is JeevaCare's own route. ClaraMed instead POSTs to each client's registered <code>webhook_url</code>.</td><td>The doc's data-flow section makes the callback JeevaCare-side.</td></tr>
+<tr><td>D3</td><td><code>type: "document"</code> accepts PDF only in v1.</td><td><code>DocumentService.extract_text_from_pdf</code> is the only extractor that exists.</td></tr>
+<tr><td>D4</td><td>Test database is PostgreSQL (<code>claramed_test</code>), not the SQLite in the current <code>tests/conftest.py</code>.</td><td>Models use PostgreSQL <code>ARRAY</code> and <code>UUID</code>; SQLite cannot create them.</td></tr>
+<tr><td>D5</td><td><code>webhook_secret</code> is stored as plaintext in the DB; API keys stay hashed.</td><td>HMAC signing needs the raw secret. Revisit with column encryption later.</td></tr>
+<tr><td>D6</td><td>URL fetcher resolves DNS, checks the IPs, then connects by hostname (no IP pinning). A DNS-rebinding window remains and is mitigated by the host allowlist.</td><td>Pinning with TLS SNI needs a custom transport; out of scope for v1.</td></tr>
+<tr><td>D7</td><td>Webhook secret rotation, JeevaCare's browser deep-link (<code>getAnalysisUrl</code>), and JWT user context are not built.</td><td>Spec non-goals.</td></tr>
+</table>
+
+<h2>File Structure</h2>
+<table>
+<tr><th>File</th><th>Responsibility</th></tr>
+<tr><td><code>tests/conftest.py</code> (modify)</td><td>PostgreSQL test DB, <code>db</code>, <code>api_client</code>, <code>make_client</code>, eager Celery</td></tr>
+<tr><td><code>backend/models/integration_client.py</code>, <code>analysis.py</code> (modify)</td><td>New columns; idempotency unique constraint</td></tr>
+<tr><td><code>migrations/versions/…_jeevacare_integration.py</code> (create)</td><td>Alembic revision for the new columns</td></tr>
+<tr><td><code>backend/core/signing.py</code> (create)</td><td>Sign and verify callback signatures</td></tr>
+<tr><td><code>backend/services/client_registry.py</code>, <code>scripts/register_client.py</code> (create)</td><td>Register a client; show key and secret once</td></tr>
+<tr><td><code>backend/api/dependencies.py</code>, <code>backend/core/security.py</code>, <code>backend/api/routes/analyses.py</code> (modify)</td><td>Mandatory auth, constant-time key compare</td></tr>
+<tr><td><code>backend/services/url_fetcher.py</code> (create)</td><td>Safe download of a client-supplied URL</td></tr>
+<tr><td><code>backend/services/audit_service.py</code> (create)</td><td>Write <code>AuditEvent</code> rows (no writer exists today)</td></tr>
+<tr><td><code>backend/services/integration_service.py</code>, <code>backend/schemas/integration.py</code>, <code>backend/api/routes/integration.py</code> (create)</td><td>Submit, results payload, routes</td></tr>
+<tr><td><code>backend/workers/tasks.py</code> (modify)</td><td>Finalize hook on success/failure</td></tr>
+<tr><td><code>backend/workers/callbacks.py</code> (create)</td><td>Callback delivery with retries</td></tr>
+<tr><td><code>backend/workers/retention.py</code>, <code>celery_app.py</code> (create/modify)</td><td>Purge expired results; beat schedule</td></tr>
+<tr><td><code>tests/support/jeevacare_stub.py</code> (create)</td><td>Test receiver that verifies signatures and can fail on demand</td></tr>
+<tr><td><code>docs/CLARAMED_API.md</code>, <code>.env.example</code> (create/modify)</td><td>Contract for JeevaCare's owner</td></tr>
+</table>
+
+<h2>Spec Coverage</h2>
+<table>
+<tr><th>Requirement</th><th>Task</th><th>Requirement</th><th>Task</th></tr>
+<tr><td>R1</td><td>T4, T6</td><td>R8</td><td>T8</td></tr>
+<tr><td>R2</td><td>T6</td><td>R9</td><td>T7, T9</td></tr>
+<tr><td>R3</td><td>T1, T6</td><td>R10</td><td>T4</td></tr>
+<tr><td>R4</td><td>T6</td><td>R11</td><td>T6</td></tr>
+<tr><td>R5</td><td>T5, T6</td><td>R12</td><td>T7, T8, T9</td></tr>
+<tr><td>R6</td><td>T1, T3</td><td>R13</td><td>T11</td></tr>
+<tr><td>R7</td><td>T2, T8</td><td>R14</td><td>T0, T10</td></tr>
+</table>
+
+<h2>Engineering Review Amendments (read before the tasks)</h2>
+<p><strong>Where an amendment conflicts with a task below, the amendment wins.</strong> They come from <code>/plan-eng-review</code> plus an independent outside voice; each was approved individually. Each amendment names the tasks it changes and carries its own tests, so implement it inside that task's TDD cycle.</p>
+
+<h3>A1. Merge finalizer and retention into <code>callbacks.py</code> (changes T7, T8, T9)</h3>
+<ul>
+<li>No <code>backend/services/finalizer.py</code> and no <code>backend/workers/retention.py</code>. <code>finalize_integration_analysis</code>, <code>purge_expired</code>, <code>purge_expired_results</code> and <code>sweep_stale_jobs</code> all live in <code>backend/workers/callbacks.py</code>. Tests: <code>tests/unit/test_finalizer.py</code> and <code>tests/unit/test_retention.py</code> import from <code>backend.workers.callbacks</code>.</li>
+<li>Import cycle fix: <code>callbacks</code> imports <code>integration_service</code>, which imports <code>workers.tasks</code>. So <code>tasks.py</code> must import lazily:
+<pre><code># backend/workers/tasks.py
+def finalize_after_task(analysis_id: str) -&gt; None:
+    try:
+        from backend.workers.callbacks import finalize_integration_analysis  # lazy: breaks the cycle
+        with get_db_context() as db:
+            finalize_integration_analysis(db, analysis_id)
+    except Exception as exc:
+        logger.error(f"Finalization failed: {exc}", analysis_id=analysis_id)</code></pre></li>
+<li><code>_default_enqueue</code> in the finalizer is just <code>deliver_callback.delay</code> (same module, no lazy import). Beat task names become <code>backend.workers.callbacks.purge_expired_results</code> and <code>backend.workers.callbacks.sweep_stale_jobs_task</code>; <code>celery_app.py</code> autodiscovers only <code>callbacks</code> (drop the retention line).</li>
+</ul>
+
+<h3>A2. Enqueue failure rolls back and returns 503 (changes T6)</h3>
+<pre><code># backend/services/integration_service.py
+class EnqueueError(Exception):
+    """The task queue was unreachable; nothing was kept."""
+
+# in submit_analysis, replacing the bare task.delay(...) call:
+    analysis_id, storage_key = str(analysis.id), key
+    try:
+        task.delay(analysis_id, str(document.id))
+    except Exception as exc:
+        logger.error("enqueue failed", error=type(exc).__name__)
+        try:
+            storage.delete_file(storage_key)
+        except Exception:
+            pass
+        db.delete(analysis)
+        db.commit()
+        record_event(db, action="analysis_enqueue_failed", resource_type="analysis",
+                     resource_id=analysis_id, outcome="failure", client_id=client.id,
+                     client_name=client.client_name)
+        raise EnqueueError("task queue unavailable") from exc</code></pre>
+<p>Route: catch <code>EnqueueError</code> and return 503 <code>{"error": {"code": "queue_unavailable", "message": "..."}}</code>. Tests (in <code>tests/api/test_integration_analyze.py</code>): <code>.delay</code> raising <code>ConnectionError</code> gives 503, zero <code>MedicalAnalysis</code> rows, the stored file is gone, an <code>analysis_enqueue_failed</code> audit row exists, and a retry after the queue recovers returns 202.</p>
+
+<h3>A3. A failed job is replaced on resubmit (changes T6)</h3>
+<pre><code># in submit_analysis, replacing the early-return on `existing`:
+    existing = _find_existing(db, client, req.type, req.record_id)
+    if existing and existing.status != AnalysisStatus.FAILED:
+        return existing, False
+    fetched = fetch_file(...)            # fetch first: a bad URL must not destroy the old failed row
+    if existing:                         # failed job: replace it
+        db.delete(existing)
+        db.flush()
+        record_event(db, action="failed_job_replaced", resource_type="analysis",
+                     resource_id=str(existing.id), outcome="success", client_id=client.id)
+    analysis = MedicalAnalysis(...)      # unchanged from T6</code></pre>
+<p>Tests: failed job plus resubmit gives a new <code>jobId</code>, the old row is gone and a task is enqueued; resubmitting a <em>completed</em> or <em>queued</em> job returns the same <code>jobId</code>; failed job plus a fetch error leaves the failed row in place; a concurrent-submit race (patch <code>_find_existing</code> to return <code>None</code> first and the real row second) returns the existing job with no new rows.</p>
+
+<h3>A4. Stale-job sweeper (new, in <code>callbacks.py</code>; changes T9, T6 task guard)</h3>
+<pre><code># backend/core/config.py
+STALE_JOB_SECONDS: int = 1800
+
+# backend/workers/callbacks.py
+def sweep_stale_jobs(db, now=None) -&gt; int:
+    now = now or datetime.utcnow()
+    cutoff = now - timedelta(seconds=settings.STALE_JOB_SECONDS)
+    stale = db.query(MedicalAnalysis).filter(
+        MedicalAnalysis.external_record_id.isnot(None),
+        MedicalAnalysis.status.in_([AnalysisStatus.PENDING, AnalysisStatus.PROCESSING]),
+        MedicalAnalysis.results_expire_at.is_(None),
+        MedicalAnalysis.created_at &lt; cutoff,
+    ).all()
+    for a in stale:
+        a.status = AnalysisStatus.FAILED
+        a.error_message = "stale: worker did not finish"
+        a.processing_completed_at = now
+        db.commit()
+        record_event(db, action="stale_job_failed", resource_type="analysis",
+                     resource_id=str(a.id), outcome="failure", client_id=a.requesting_client_id)
+        finalize_integration_analysis(db, str(a.id))
+    return len(stale)
+
+@celery_app.task
+def sweep_stale_jobs_task() -&gt; int:
+    with get_db_context() as db:
+        return sweep_stale_jobs(db)</code></pre>
+<p>Beat entry <code>sweep-stale-jobs</code> every 600 s. Guard in both processing tasks right after loading the analysis: <code>if analysis.status == AnalysisStatus.FAILED: logger.info("skipping failed analysis"); return</code>, so a late worker cannot overwrite a swept job. Tests: an old pending job is failed and a callback enqueued; a recent job, a completed job and a legacy (no record id) job are untouched; a late task run on a swept job exits without changing it.</p>
+
+<h3>A5. Twelve added test gaps (changes T0, T6, T7, T8, T10)</h3>
+<table>
+<tr><th>#</th><th>Test (file)</th><th>Asserts</th></tr>
+<tr><td>1</td><td><strong>Spike first</strong>, <code>tests/unit/test_eager_hooks.py</code></td><td>Two throwaway tasks with <code>base=AnalysisTask</code>, one returning and one raising: <code>.apply()</code> calls <code>finalize_after_task</code> for each (monkeypatched recorder). If this fails, move finalization into a <code>finally</code> path in the task bodies and delete the hooks.</td></tr>
+<tr><td>2</td><td>enqueue rollback (A2)</td><td>503, no rows, file gone, audit row</td></tr>
+<tr><td>3</td><td>failed resubmit (A3)</td><td>new job replaces failed one</td></tr>
+<tr><td>4</td><td>concurrent submit race (A3)</td><td>IntegrityError branch returns existing job</td></tr>
+<tr><td>5</td><td>client without <code>webhook_url</code></td><td>finalize sets <code>delivery_status="skipped"</code>, no callback queued, <code>/status</code> shows <code>deliveryStatus: "skipped"</code></td></tr>
+<tr><td>6</td><td>client deactivated after finalize</td><td><code>run_delivery_attempt</code> makes no HTTP call, sets <code>skipped</code>, returns <code>"failed"</code></td></tr>
+<tr><td>7</td><td><code>deliver_callback</code> wrapper</td><td>patch <code>run_delivery_attempt</code> to return <code>"retry"</code> then <code>"delivered"</code>; <code>deliver_callback.apply(args=[id])</code> succeeds and the recorded attempt indices are <code>[0, 1]</code></td></tr>
+<tr><td>8</td><td>auth (A9 area, <code>test_auth_required.py</code>)</td><td>inactive client's key gives 401; <code>last_used_at</code> unchanged on a second call within 60 s</td></tr>
+<tr><td>9</td><td>document task failure</td><td>corrupt PDF gives a <code>failed</code> callback with no retries (A12)</td></tr>
+<tr><td>10</td><td><code>tests/unit/test_migration_roundtrip.py</code></td><td>create scratch DB <code>claramed_migration_test</code> (autocommit connect to <code>postgres</code>); run <code>python -m alembic upgrade head</code>, <code>downgrade -1</code>, <code>upgrade head</code> with <code>DATABASE_URL</code> overridden in the subprocess env; drop DB</td></tr>
+<tr><td>11</td><td>slow-drip download (A7)</td><td>FetchError <code>fetch_failed</code></td></tr>
+<tr><td>12</td><td>sweeper (A4)</td><td>cases listed in A4</td></tr>
+</table>
+<p>Finalize and delivery code for item 5/6 (add to <code>finalize_integration_analysis</code> before the enqueue, and at the top of <code>run_delivery_attempt</code>):</p>
+<pre><code>client = db.get(IntegrationClient, analysis.requesting_client_id)
+if client is None or not client.active or not client.webhook_url:
+    analysis.delivery_status = "skipped"
+    db.commit()
+    return True            # finalized, but nothing to deliver; the client can still poll /status</code></pre>
+
+<h3>A6. Process-level model cache (new Task 12; touches <code>radiology_service.py</code>)</h3>
+<p><strong>Requirements:</strong> performance (review issue 6). <strong>Relies on:</strong> EXISTS: backend/services/radiology_service.py RadiologyService.load_model.</p>
+<pre><code># tests/unit/test_radiology_model_cache.py
+from unittest.mock import MagicMock, patch
+from backend.services.radiology_service import RadiologyService, _MODEL_CACHE
+
+def test_two_instances_share_one_loaded_model():
+    _MODEL_CACHE.clear()
+    fake = MagicMock(); fake.to.return_value = fake; fake.pathologies = ["Edema"]
+    with patch("torchxrayvision.models.DenseNet", return_value=fake) as ctor:
+        a, b = RadiologyService(), RadiologyService()
+        assert a.load_model() and b.load_model()
+    assert ctor.call_count == 1 and a.model is b.model</code></pre>
+<pre><code># backend/services/radiology_service.py
+import threading
+_MODEL_CACHE: dict[tuple[str, str], tuple[Any, list]] = {}
+_MODEL_LOCK = threading.Lock()
+
+# in load_model(), replace the load section (lines 41-76) so it first checks the cache:
+        key = (self.model_name, self.device)
+        with _MODEL_LOCK:
+            cached = _MODEL_CACHE.get(key)
+            if cached:
+                self.model, self.supported_labels = cached
+                self.model_loaded = True
+                return True
+            ...existing load code unchanged...
+            _MODEL_CACHE[key] = (self.model, self.supported_labels)</code></pre>
+<p>Run: <code>python -m pytest tests/unit/test_radiology_model_cache.py -v</code>. Commit: <code>perf: share one loaded radiology model per process</code>.</p>
+
+<h3>A7. 30 s total download deadline (changes T5)</h3>
+<pre><code># fetch_file(..., total_timeout: float = 30.0)
+deadline = time.monotonic() + total_timeout
+def _check():
+    if time.monotonic() &gt; deadline:
+        raise FetchError("fetch_failed", "download timed out")
+# call _check() at the top of each hop and after every chunk in iter_bytes</code></pre>
+<pre><code>def test_slow_drip_hits_the_total_deadline():
+    class Slow(httpx.SyncByteStream):
+        def __iter__(self):
+            yield b"\x89PNG\r\n\x1a\n"
+            for _ in range(50):
+                time.sleep(0.03)
+                yield b"x" * 10
+    handler = lambda req: httpx.Response(200, stream=Slow())
+    with pytest.raises(FetchError) as e:
+        fetch_file("https://res.cloudinary.com/a.png", allowed_hosts=["res.cloudinary.com"], kind="radiology",
+                   max_bytes=10_000, client=_client(handler), resolver=PUBLIC, total_timeout=0.1)
+    assert e.value.code == "fetch_failed"</code></pre>
+
+<h3>A8. Accept JeevaCare's documented field names (changes T6)</h3>
+<p>JeevaCare's flow sends <code>{radiologyId, imageUrl, patientId, metadata}</code> with no <code>type</code>. <code>AnalyzeRequest</code> therefore accepts <code>imageUrl</code> as an alias of <code>fileUrl</code>, <code>patientId</code> as an alias of <code>patientRef</code>, and infers <code>type</code> (<code>radiology</code> when <code>radiologyId</code> is present, <code>document</code> when <code>documentId</code> is present). Exactly one of the URL fields and exactly one of the ids is required.</p>
+<pre><code>class AnalyzeRequest(BaseModel):
+    type: Optional[Literal["radiology", "document"]] = None
+    radiologyId: Optional[str] = Field(default=None, min_length=1, max_length=255)
+    documentId: Optional[str] = Field(default=None, min_length=1, max_length=255)
+    fileUrl: Optional[HttpUrl] = None
+    imageUrl: Optional[HttpUrl] = None
+    patientRef: Optional[str] = Field(default=None, max_length=255)
+    patientId: Optional[str] = Field(default=None, max_length=255)
+    hospitalRef: Optional[str] = Field(default=None, max_length=255)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _normalise(self):
+        if (self.radiologyId is None) == (self.documentId is None):
+            raise ValueError("send exactly one of radiologyId or documentId")
+        inferred = "radiology" if self.radiologyId is not None else "document"
+        if self.type not in (None, inferred):
+            raise ValueError(f"type '{self.type}' does not match the id sent")
+        self.type = inferred
+        if (self.fileUrl is None) == (self.imageUrl is None):
+            raise ValueError("send exactly one of fileUrl or imageUrl")
+        return self
+
+    @property
+    def record_id(self) -&gt; str:
+        return self.radiologyId or self.documentId
+
+    @property
+    def file_url(self) -&gt; str:
+        return str(self.fileUrl or self.imageUrl)
+
+    @property
+    def patient_ref(self):
+        return self.patientRef or self.patientId</code></pre>
+<p>The service uses <code>req.file_url</code> and <code>req.patient_ref</code>. Tests: the exact JeevaCare-doc body (<code>radiologyId</code>, <code>imageUrl</code>, <code>patientId</code>, <code>metadata</code>, no <code>type</code>) returns 202; both URL fields gives 422; mismatched <code>type</code> gives 422; the original T6 body still works. The T6 test case "<code>{"type": "document", "radiologyId": ...}</code>" still gives 422.</p>
+
+<h3>A9. Callback auth token and honest contract notes (changes T1, T3, T8, T11)</h3>
+<ul>
+<li>New optional column <code>IntegrationClient.callback_auth_token</code> (<code>String(255)</code>, nullable; same plaintext caveat as D5), added in the T1 migration. <code>register_client(..., callback_auth_token: str | None = None)</code> and CLI flag <code>--callback-token</code>.</li>
+<li><code>run_delivery_attempt</code> adds <code>Authorization: Bearer &lt;token&gt;</code> when the client has one, in addition to the HMAC headers. <code>JeevaCareStub(secret, expected_token=None)</code> answers 401 when the token is expected and wrong or missing. Tests: header present when set, absent when not, wrong token gives <code>"retry"</code>.</li>
+<li><code>CLARAMED_API.md</code> must state: signature covers the <em>raw</em> body (the receiver needs raw-body capture, e.g. <code>express.json({verify})</code>); failed analyses send <code>status: "failed"</code> with <code>results: null</code> and the receiver must branch on <code>status</code>; ClaraMed treats any non-2xx as a failed attempt.</li>
+<li><strong>Launch gate:</strong> confirm with JeevaCare's owner that their callback route accepts this scheme before production. Our stub only proves ClaraMed agrees with itself.</li>
+</ul>
+
+<h3>A10. Storage topology warning (changes T1 config, T11 doc)</h3>
+<pre><code># backend/core/config.py
+def storage_topology_warning(app_env: str, provider: str) -&gt; str | None:
+    if app_env == "production" and provider == "local":
+        return ("STORAGE_PROVIDER=local in production: the API and Celery worker must share the same "
+                "volume, or use STORAGE_PROVIDER=s3. Files written by the API are otherwise invisible to the worker.")
+    return None</code></pre>
+<p>Called in <code>lifespan</code> in <code>main.py</code> and logged as a warning. Tests: production+local returns the message; development+local, production+s3 return <code>None</code>. The contract doc states the requirement. Choosing the host stays out of scope.</p>
+
+<h3>A11. Tenant isolation on the old routes (changes T4)</h3>
+<p>Add <code>tests/api/test_tenant_isolation.py</code>: client A owns analyses (insert rows directly with <code>requesting_client_id</code>). Client B cannot read A's detail (<code>GET /analyses/{id}</code>), results, or upload documents/images (expect 403 as the routes return today; confirm each against the route when writing the test), and A's analyses are absent from B's <code>GET /analyses</code> list. An ownerless analysis (no client, no hospital reference) is denied to every client. <code>CLARAMED_API.md</code> documents that <em>pre-existing ownerless analyses become inaccessible</em> (no backfill) and that the Streamlit UI needs its own registered client and <code>CLARAMED_API_KEY</code>.</p>
+
+<h3>A12. Non-retryable input errors (changes T7 hooks, <code>tasks.py</code>)</h3>
+<pre><code># backend/workers/tasks.py
+class NonRetryableError(Exception):
+    """Deterministic bad input (corrupt image, unreadable PDF). Fail now, do not retry."""
+
+# in each processing task, before the generic handler:
+    except NonRetryableError:
+        raise                       # AnalysisTask.on_failure marks FAILED and finalizes immediately
+    except Exception as e:
+        logger.error(...)
+        raise self.retry(exc=e, countdown=60)</code></pre>
+<p>Method: write failing tests first with a truncated PNG and with non-PDF bytes through the real task, observe which exceptions come out (<code>backend.core.exceptions.ValidationError</code> from <code>RadiologyService.validate_image</code>, PyPDF2 read errors, <code>PIL.UnidentifiedImageError</code>), then map exactly those to <code>NonRetryableError</code>. Transient errors keep the three retries. Tests: a corrupt input reaches a <code>failed</code> callback after one model/extraction attempt (count calls), a transient error is still retried.</p>
+
+<h3>A13. Live-worker smoke test and test baseline (changes T0, T11)</h3>
+<ul>
+<li><strong>T0:</strong> before replacing <code>conftest.py</code>, run the old suite (<code>PYTHONPATH=. python -m pytest tests -q</code>) and record failing modules and reasons in <code>tests/KNOWN_FAILURES.md</code> (already known: <code>tests/integration/test_radiology_workflow.py</code> cannot import <code>RadiologyFinding</code> from <code>backend.models.analysis</code>). Do not fix them in this plan; new failures must be distinguishable from these.</li>
+<li><strong>T11:</strong> <code>scripts/jeevacare_smoke.py</code>, run against a real Redis, a real <code>celery ... worker --pool=solo</code>, the dev database, and no eager mode. It registers a throwaway client directly through the ORM (so a loopback <code>http://127.0.0.1:&lt;port&gt;/cb</code> webhook is allowed), starts a local receiver that verifies the signature, stores a synthetic PNG with <code>StorageService</code>, creates the analysis and document rows, calls <code>process_radiology_async.delay</code>, and waits up to 120 s for the callback. It prints PASS or FAIL, checks the stored file is gone, and deletes its client and rows. It covers worker, hook, finalize and callback under real Celery; fetch intake is covered by the unit tests.</li>
+</ul>
+
+<h3>A14. Deviations added by this review</h3>
+<table>
+<tr><th>ID</th><th>Deviation</th><th>Why</th></tr>
+<tr><td>D8</td><td>Request fields <code>imageUrl</code>/<code>patientId</code> accepted as aliases; <code>type</code> inferred (A8).</td><td>Matches JeevaCare's documented request body.</td></tr>
+<tr><td>D9</td><td>Pre-existing ownerless analyses become inaccessible; no backfill (A11).</td><td>Auth is now mandatory; ownerless rows are denied by <code>check_analysis_access</code>.</td></tr>
+<tr><td>D10</td><td><code>callback_auth_token</code> is stored in plaintext like D5 (A9).</td><td>Needed to send it; encryption is a tracked TODO.</td></tr>
+<tr><td>D11</td><td>Clients with no webhook or deactivated clients get <code>delivery_status="skipped"</code> and stay pollable (A5).</td><td>Legacy clients registered before the migration have no webhook.</td></tr>
+</table>
+
+<!-- ============================ T0 ============================ -->
+<div class="task">
+<h3>Task 0: Test harness on PostgreSQL</h3>
+<p class="meta"><strong>Requirements:</strong> R14 (foundation) · Deviations: D4</p>
+<p><strong>Files:</strong></p>
+<ul>
+<li>Modify: <code>tests/conftest.py</code></li>
+<li>Modify: <code>.gitignore</code> (add <code>venv/</code>, <code>test.db</code>)</li>
+<li>Create: <code>pytest.ini</code></li>
+<li>Test: <code>tests/test_harness.py</code></li>
+</ul>
+<p><strong>Relies on:</strong></p>
+<ul>
+<li>EXISTS: backend/database/connection.py get_db_context</li>
+<li>EXISTS: backend/database/connection.py get_db</li>
+<li>EXISTS: backend/workers/celery_app.py celery_app</li>
+<li>EXISTS: backend/main.py app</li>
+</ul>
+<p><strong>Interfaces:</strong><br>
+Produces fixtures <code>db</code> (SQLAlchemy Session on <code>claramed_test</code>, tables truncated after each test), <code>api_client</code> (<code>fastapi.testclient.TestClient</code> with <code>get_db</code> overridden to <code>db</code>), autouse eager Celery, and <code>STORAGE_LOCAL_PATH</code> pointing at a temp dir exposed as <code>storage_dir</code> (<code>pathlib.Path</code>).</p>
+
+<p class="step">- [ ] Step 1: Commit the existing driver fix and create the test database</p>
+<pre><code>export PATH=/opt/homebrew/opt/postgresql@16/bin:$PATH
+createdb -O claramed claramed_test
+git add backend/core/config.py .slash-cli/specs
+git commit -m "fix: pin psycopg2 driver for postgresql URLs; add JeevaCare design spec"</code></pre>
+<p>Run: <code>psql -d claramed_test -c "select 1"</code><br>Expected: one row.</p>
+
+<p class="step">- [ ] Step 2: Write the failing test</p>
+<pre><code># tests/test_harness.py
+def test_db_is_the_test_database(db):
+    assert db.bind.url.database == "claramed_test"
+
+
+def test_api_client_reaches_health(api_client):
+    assert api_client.get("/api/v1/health").status_code == 200
+
+
+def test_storage_dir_is_isolated(storage_dir):
+    assert "claramed_storage" in str(storage_dir)</code></pre>
+
+<p class="step">- [ ] Step 3: Run it to verify it fails</p>
+<p>Run: <code>source venv/bin/activate &amp;&amp; python -m pytest tests/test_harness.py -v</code><br>Expected: FAIL with <code>fixture 'db' not found</code> (the old fixture is named <code>test_db</code>).</p>
+
+<p class="step">- [ ] Step 4: Replace <code>tests/conftest.py</code> and add <code>pytest.ini</code></p>
+<pre><code># tests/conftest.py
+"""Pytest configuration. Runs against the PostgreSQL database claramed_test."""
+import os
+import tempfile
+from pathlib import Path
+
+from dotenv import dotenv_values
+from sqlalchemy.engine import make_url
+
+# Must run before any backend import so settings and the global engine use the test DB.
+_base_url = os.environ.get("TEST_DATABASE_URL") or dotenv_values(".env").get("DATABASE_URL")
+os.environ["DATABASE_URL"] = str(make_url(_base_url).set(database="claramed_test"))
+_STORAGE = Path(tempfile.mkdtemp(prefix="claramed_storage_"))
+os.environ["STORAGE_LOCAL_PATH"] = str(_STORAGE)
+os.environ["STORAGE_PROVIDER"] = "local"
+
+import pytest  # noqa: E402
+from fastapi.testclient import TestClient  # noqa: E402
+from sqlalchemy import text  # noqa: E402
+from sqlalchemy.orm import sessionmaker  # noqa: E402
+
+import backend.models  # noqa: E402,F401  (register every table on Base)
+from backend.database.connection import Base, engine, get_db  # noqa: E402
+from backend.main import app  # noqa: E402
+from backend.workers.celery_app import celery_app  # noqa: E402
+
+_Session = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _schema():
+    Base.metadata.drop_all(bind=engine)
+    Base.metadata.create_all(bind=engine)
+    yield
+    Base.metadata.drop_all(bind=engine)
+
+
+@pytest.fixture(autouse=True)
+def _eager_celery():
+    celery_app.conf.task_always_eager = True
+    celery_app.conf.task_eager_propagates = False
+    yield
+
+
+@pytest.fixture
+def db():
+    session = _Session()
+    try:
+        yield session
+    finally:
+        session.rollback()
+        session.close()
+        tables = ", ".join(f'"{t.name}"' for t in Base.metadata.sorted_tables)
+        with engine.begin() as conn:
+            conn.execute(text(f"TRUNCATE {tables} RESTART IDENTITY CASCADE"))
+
+
+@pytest.fixture
+def api_client(db):
+    app.dependency_overrides[get_db] = lambda: db
+    with TestClient(app) as client:
+        yield client
+    app.dependency_overrides.clear()
+
+
+@pytest.fixture
+def storage_dir():
+    return _STORAGE
+
+
+@pytest.fixture
+def sample_symptoms():
+    return {
+        "simple": "I have a headache",
+        "detailed": "I have had a severe headache for 3 days, along with nausea and sensitivity to light.",
+        "emergency": "Severe chest pain radiating to left arm, difficulty breathing",
+    }
+
+
+@pytest.fixture
+def sample_languages():
+    return ["English", "Hindi", "Spanish"]</code></pre>
+<pre><code># pytest.ini
+[pytest]
+testpaths = tests
+markers =
+    slow: runs real model inference (deselect with -m "not slow")</code></pre>
+<pre><code># .gitignore additions
+venv/
+test.db</code></pre>
+
+<p class="step">- [ ] Step 5: Run the harness test and the existing suite</p>
+<p>Run: <code>python -m pytest tests/test_harness.py tests/api/test_health.py -v</code><br>Expected: 4 passed. Then run <code>python -m pytest -q -m "not slow"</code>; note any pre-existing failures in the commit message instead of fixing unrelated tests.</p>
+
+<p class="step">- [ ] Step 6: Commit</p>
+<pre><code>git add tests/conftest.py tests/test_harness.py pytest.ini .gitignore
+git commit -m "test: run suite against PostgreSQL claramed_test with shared fixtures"</code></pre>
+</div>
+
+<!-- ============================ T1 ============================ -->
+<div class="task">
+<h3>Task 1: Schema for per-client config, idempotency and delivery state</h3>
+<p class="meta"><strong>Requirements:</strong> R3, R6, R8, R9</p>
+<p><strong>Files:</strong></p>
+<ul>
+<li>Modify: <code>backend/models/integration_client.py</code></li>
+<li>Modify: <code>backend/models/analysis.py</code></li>
+<li>Create: <code>migrations/versions/&lt;generated&gt;_jeevacare_integration.py</code></li>
+<li>Modify: <code>backend/core/config.py</code></li>
+<li>Test: <code>tests/unit/test_integration_models.py</code></li>
+</ul>
+<p><strong>Relies on:</strong></p>
+<ul>
+<li>EXISTS: backend/models/integration_client.py IntegrationClient</li>
+<li>EXISTS: backend/models/analysis.py MedicalAnalysis</li>
+<li>EXISTS: backend/core/config.py Settings</li>
+</ul>
+<p><strong>Interfaces:</strong><br>
+Produces <code>IntegrationClient.webhook_url: str|None</code>, <code>.webhook_secret: str|None</code>, <code>.allowed_file_hosts: list[str]</code>;
+<code>MedicalAnalysis.external_record_id: str|None</code>, <code>.external_record_kind: str|None</code> ("radiology"|"document"), <code>.delivery_status: str|None</code> ("pending"|"delivered"|"failed"), <code>.delivery_attempts: int</code>, <code>.delivery_last_error: str|None</code>, <code>.callback_delivered_at: datetime|None</code>, <code>.results_expire_at: datetime|None</code>;
+unique constraint <code>uq_analysis_client_record</code> on (<code>requesting_client_id</code>, <code>external_record_kind</code>, <code>external_record_id</code>);
+settings <code>CLARAMED_INTEGRATION_ENABLED: bool = True</code>, <code>CALLBACK_MAX_ATTEMPTS: int = 5</code>, <code>CALLBACK_BACKOFF_BASE_SECONDS: int = 120</code>, <code>CALLBACK_TIMEOUT_SECONDS: int = 10</code>, <code>RESULT_RETENTION_DAYS: int = 30</code>.</p>
+
+<p class="step">- [ ] Step 1: Write the failing test</p>
+<pre><code># tests/unit/test_integration_models.py
+import pytest
+from sqlalchemy.exc import IntegrityError
+
+from backend.models.analysis import AnalysisType, MedicalAnalysis
+from backend.models.integration_client import IntegrationClient
+
+
+def _client(db, name="jeevacare"):
+    c = IntegrationClient(
+        client_name=name,
+        hashed_api_key=f"hash-{name}",
+        scopes=["analysis:create"],
+        webhook_url="https://jeevacare.test/api/webhook/claramed-callback",
+        webhook_secret="s3cret",
+        allowed_file_hosts=["res.cloudinary.com"],
+    )
+    db.add(c)
+    db.commit()
+    return c
+
+
+def test_client_stores_webhook_config(db):
+    c = _client(db)
+    db.refresh(c)
+    assert c.webhook_url.startswith("https://")
+    assert c.allowed_file_hosts == ["res.cloudinary.com"]
+
+
+def test_same_record_twice_for_one_client_is_rejected(db):
+    c = _client(db)
+    for _ in range(2):
+        db.add(MedicalAnalysis(
+            analysis_type=AnalysisType.XRAY,
+            requesting_client_id=c.id,
+            external_record_kind="radiology",
+            external_record_id="rad-1",
+        ))
+    with pytest.raises(IntegrityError):
+        db.commit()
+
+
+def test_same_record_id_for_different_clients_is_allowed(db):
+    a, b = _client(db, "a"), _client(db, "b")
+    for c in (a, b):
+        db.add(MedicalAnalysis(
+            analysis_type=AnalysisType.XRAY,
+            requesting_client_id=c.id,
+            external_record_kind="radiology",
+            external_record_id="rad-1",
+        ))
+    db.commit()
+
+
+def test_delivery_attempts_defaults_to_zero(db):
+    c = _client(db)
+    a = MedicalAnalysis(analysis_type=AnalysisType.XRAY, requesting_client_id=c.id)
+    db.add(a)
+    db.commit()
+    assert a.delivery_attempts == 0</code></pre>
+
+<p class="step">- [ ] Step 2: Run to verify it fails</p>
+<p>Run: <code>python -m pytest tests/unit/test_integration_models.py -v</code><br>Expected: FAIL (<code>TypeError: 'webhook_url' is an invalid keyword argument</code>).</p>
+
+<p class="step">- [ ] Step 3: Implement the columns</p>
+<pre><code># backend/models/integration_client.py  (add after the rate-limit columns)
+    # Integration callback configuration
+    webhook_url = Column(String(500), nullable=True)
+    webhook_secret = Column(String(128), nullable=True)
+    allowed_file_hosts = Column(ARRAY(String), default=list, nullable=False)</code></pre>
+<pre><code># backend/models/analysis.py
+# 1) imports: add Integer, UniqueConstraint
+from sqlalchemy import Column, String, DateTime, Boolean, Enum, Text, JSON, Integer, UniqueConstraint
+
+# 2) after request_id:
+    # Integration (client-supplied record, idempotency, callback state)
+    external_record_id = Column(String(255), nullable=True)
+    external_record_kind = Column(String(20), nullable=True)
+    delivery_status = Column(String(20), nullable=True)
+    delivery_attempts = Column(Integer, default=0, nullable=False, server_default="0")
+    delivery_last_error = Column(String(500), nullable=True)
+    callback_delivered_at = Column(DateTime, nullable=True)
+    results_expire_at = Column(DateTime, nullable=True, index=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "requesting_client_id", "external_record_kind", "external_record_id",
+            name="uq_analysis_client_record",
+        ),
+    )</code></pre>
+<pre><code># backend/core/config.py  (replace the "# Integration" block)
+    # Integration
+    CLARAMED_INTEGRATION_ENABLED: bool = True
+    CALLBACK_MAX_ATTEMPTS: int = 5
+    CALLBACK_BACKOFF_BASE_SECONDS: int = 120   # 120+240+480+960 = 30 min between 5 attempts
+    CALLBACK_TIMEOUT_SECONDS: int = 10
+    RESULT_RETENTION_DAYS: int = 30
+    # Deprecated, unused: per-client webhook settings now live on IntegrationClient
+    JEEVACARE_WEBHOOK_SECRET: Optional[str] = None
+    JEEVACARE_CALLBACK_URL: Optional[str] = None</code></pre>
+
+<p class="step">- [ ] Step 4: Generate and apply the migration</p>
+<pre><code>python -m alembic revision --autogenerate -m "jeevacare integration"
+python -m alembic upgrade head</code></pre>
+<p>Run: <code>python -m alembic downgrade -1 &amp;&amp; python -m alembic upgrade head &amp;&amp; python -m pytest tests/unit/test_integration_models.py -v</code><br>
+Expected: downgrade and upgrade both succeed; 4 passed. Open the generated file and confirm it adds 3 columns to <code>integration_clients</code>, 7 to <code>medical_analyses</code>, and the unique constraint; the <code>allowed_file_hosts</code> column needs <code>server_default=sa.text("'{}'")</code> so existing rows migrate.</p>
+
+<p class="step">- [ ] Step 5: Commit</p>
+<pre><code>git add backend/models backend/core/config.py migrations tests/unit/test_integration_models.py
+git commit -m "feat: integration client webhook config and analysis delivery state"</code></pre>
+</div>
+
+<!-- ============================ T2 ============================ -->
+<div class="task">
+<h3>Task 2: Callback signing</h3>
+<p class="meta"><strong>Requirements:</strong> R7</p>
+<p><strong>Files:</strong></p>
+<ul>
+<li>Create: <code>backend/core/signing.py</code></li>
+<li>Test: <code>tests/unit/test_signing.py</code></li>
+</ul>
+<p><strong>Relies on:</strong> nothing outside the standard library.</p>
+<p><strong>Interfaces:</strong><br>
+Produces <code>sign_payload(secret: str, timestamp: int, body: bytes) -&gt; str</code> returning <code>"sha256=&lt;hex&gt;"</code>, and
+<code>verify_signature(secret: str, timestamp: int, body: bytes, signature: str, now: float | None = None, tolerance: int = 300) -&gt; bool</code>.</p>
+
+<p class="step">- [ ] Step 1: Write the failing test</p>
+<pre><code># tests/unit/test_signing.py
+import hashlib
+import hmac
+
+from backend.core.signing import sign_payload, verify_signature
+
+BODY = b'{"jobId":"abc","status":"completed"}'
+
+
+def test_matches_independent_hmac():
+    expected = "sha256=" + hmac.new(b"k", b"1700000000." + BODY, hashlib.sha256).hexdigest()
+    assert sign_payload("k", 1700000000, BODY) == expected
+
+
+def test_roundtrip_verifies():
+    sig = sign_payload("k", 1700000000, BODY)
+    assert verify_signature("k", 1700000000, BODY, sig, now=1700000010)
+
+
+def test_tampered_body_fails():
+    sig = sign_payload("k", 1700000000, BODY)
+    assert not verify_signature("k", 1700000000, BODY + b" ", sig, now=1700000010)
+
+
+def test_wrong_secret_fails():
+    sig = sign_payload("k", 1700000000, BODY)
+    assert not verify_signature("other", 1700000000, BODY, sig, now=1700000010)
+
+
+def test_stale_timestamp_fails():
+    sig = sign_payload("k", 1700000000, BODY)
+    assert not verify_signature("k", 1700000000, BODY, sig, now=1700000000 + 301)</code></pre>
+
+<p class="step">- [ ] Step 2: Run to verify it fails</p>
+<p>Run: <code>python -m pytest tests/unit/test_signing.py -v</code><br>Expected: FAIL with <code>ModuleNotFoundError: backend.core.signing</code>.</p>
+
+<p class="step">- [ ] Step 3: Implement</p>
+<pre><code># backend/core/signing.py
+"""HMAC signing for outbound webhook callbacks."""
+import hashlib
+import hmac
+import time
+
+SIGNATURE_PREFIX = "sha256="
+DEFAULT_TOLERANCE_SECONDS = 300
+
+
+def sign_payload(secret: str, timestamp: int, body: bytes) -&gt; str:
+    """Return 'sha256=&lt;hex&gt;' over '&lt;timestamp&gt;.&lt;body&gt;'."""
+    message = f"{int(timestamp)}.".encode() + body
+    return SIGNATURE_PREFIX + hmac.new(secret.encode(), message, hashlib.sha256).hexdigest()
+
+
+def verify_signature(
+    secret: str,
+    timestamp: int,
+    body: bytes,
+    signature: str,
+    now: float | None = None,
+    tolerance: int = DEFAULT_TOLERANCE_SECONDS,
+) -&gt; bool:
+    current = time.time() if now is None else now
+    if abs(current - int(timestamp)) &gt; tolerance:
+        return False
+    expected = sign_payload(secret, int(timestamp), body)
+    return hmac.compare_digest(expected, signature)</code></pre>
+
+<p class="step">- [ ] Step 4: Run to verify it passes</p>
+<p>Run: <code>python -m pytest tests/unit/test_signing.py -v</code><br>Expected: 5 passed.</p>
+
+<p class="step">- [ ] Step 5: Commit</p>
+<pre><code>git add backend/core/signing.py tests/unit/test_signing.py
+git commit -m "feat: HMAC signing and verification for callbacks"</code></pre>
+</div>
+
+<!-- ============================ T3 ============================ -->
+<div class="task">
+<h3>Task 3: Client registration (service, CLI, test fixture)</h3>
+<p class="meta"><strong>Requirements:</strong> R6</p>
+<p><strong>Files:</strong></p>
+<ul>
+<li>Create: <code>backend/services/client_registry.py</code></li>
+<li>Create: <code>scripts/register_client.py</code></li>
+<li>Modify: <code>tests/conftest.py</code> (add <code>make_client</code>, <code>auth_headers</code>)</li>
+<li>Test: <code>tests/unit/test_client_registry.py</code></li>
+</ul>
+<p><strong>Relies on:</strong></p>
+<ul>
+<li>EXISTS: backend/core/security.py generate_api_key</li>
+<li>EXISTS: backend/core/security.py hash_api_key</li>
+<li>EXISTS: backend/models/integration_client.py IntegrationClient</li>
+</ul>
+<p><strong>Interfaces:</strong><br>
+Consumes <code>IntegrationClient</code> columns from Task 1.<br>
+Produces <code>register_client(db, *, name: str, webhook_url: str, allowed_file_hosts: list[str], scopes: list[str] | None = None, description: str | None = None) -&gt; RegisteredClient</code>
+where <code>RegisteredClient</code> is a dataclass with <code>client: IntegrationClient</code>, <code>api_key: str</code>, <code>webhook_secret: str</code>; raises <code>ValueError</code> on invalid input or duplicate name.
+Fixtures: <code>make_client(name="jeevacare", **overrides) -&gt; RegisteredClient</code> and <code>auth_headers(api_key) -&gt; dict</code> returning <code>{"Authorization": "Bearer &lt;key&gt;"}</code>.</p>
+
+<p class="step">- [ ] Step 1: Write the failing test</p>
+<pre><code># tests/unit/test_client_registry.py
+import pytest
+
+from backend.core.security import verify_api_key
+from backend.services.client_registry import register_client
+
+URL = "https://jeevacare.test/api/webhook/claramed-callback"
+
+
+def test_registers_with_hashed_key_and_secret(db):
+    reg = register_client(db, name="jeevacare", webhook_url=URL,
+                          allowed_file_hosts=["res.cloudinary.com"])
+    assert reg.api_key.startswith("sk_claramed_")
+    assert reg.client.hashed_api_key != reg.api_key
+    assert verify_api_key(reg.api_key, reg.client.hashed_api_key)
+    assert len(reg.webhook_secret) &gt;= 32
+    assert reg.client.scopes == ["analysis:create", "analysis:read"]
+
+
+def test_rejects_non_https_webhook(db):
+    with pytest.raises(ValueError, match="https"):
+        register_client(db, name="x", webhook_url="http://insecure.test/cb",
+                        allowed_file_hosts=["a.test"])
+
+
+def test_rejects_empty_host_allowlist(db):
+    with pytest.raises(ValueError, match="allowed_file_hosts"):
+        register_client(db, name="x", webhook_url=URL, allowed_file_hosts=[])
+
+
+def test_rejects_host_with_scheme_or_path(db):
+    with pytest.raises(ValueError, match="hostname"):
+        register_client(db, name="x", webhook_url=URL,
+                        allowed_file_hosts=["https://res.cloudinary.com/x"])
+
+
+def test_duplicate_name_rejected(db):
+    register_client(db, name="dup", webhook_url=URL, allowed_file_hosts=["a.test"])
+    with pytest.raises(ValueError, match="already exists"):
+        register_client(db, name="dup", webhook_url=URL, allowed_file_hosts=["a.test"])</code></pre>
+
+<p class="step">- [ ] Step 2: Run to verify it fails</p>
+<p>Run: <code>python -m pytest tests/unit/test_client_registry.py -v</code><br>Expected: FAIL with <code>ModuleNotFoundError: backend.services.client_registry</code>.</p>
+
+<p class="step">- [ ] Step 3: Implement the service</p>
+<pre><code># backend/services/client_registry.py
+"""Register integration clients (admin operation)."""
+import re
+import secrets
+from dataclasses import dataclass
+from urllib.parse import urlparse
+
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
+
+from backend.core.security import generate_api_key, hash_api_key
+from backend.models.integration_client import IntegrationClient
+
+DEFAULT_SCOPES = ["analysis:create", "analysis:read"]
+_HOST_RE = re.compile(r"^(\*\.)?([a-z0-9-]+\.)+[a-z0-9-]+$")
+
+
+@dataclass
+class RegisteredClient:
+    client: IntegrationClient
+    api_key: str
+    webhook_secret: str
+
+
+def _validate(webhook_url: str, hosts: list[str]) -&gt; list[str]:
+    parsed = urlparse(webhook_url)
+    if parsed.scheme != "https" or not parsed.hostname:
+        raise ValueError("webhook_url must be an https URL")
+    if not hosts:
+        raise ValueError("allowed_file_hosts must contain at least one hostname")
+    cleaned = [h.strip().lower() for h in hosts]
+    for host in cleaned:
+        if not _HOST_RE.match(host):
+            raise ValueError(f"allowed_file_hosts entry is not a bare hostname: {host!r}")
+    return cleaned
+
+
+def register_client(
+    db: Session,
+    *,
+    name: str,
+    webhook_url: str,
+    allowed_file_hosts: list[str],
+    scopes: list[str] | None = None,
+    description: str | None = None,
+) -&gt; RegisteredClient:
+    hosts = _validate(webhook_url, allowed_file_hosts)
+    api_key = generate_api_key()
+    webhook_secret = secrets.token_hex(32)
+    client = IntegrationClient(
+        client_name=name,
+        description=description,
+        hashed_api_key=hash_api_key(api_key),
+        scopes=list(scopes or DEFAULT_SCOPES),
+        webhook_url=webhook_url,
+        webhook_secret=webhook_secret,
+        allowed_file_hosts=hosts,
+        active=True,
+    )
+    db.add(client)
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise ValueError(f"client {name!r} already exists") from exc
+    return RegisteredClient(client=client, api_key=api_key, webhook_secret=webhook_secret)</code></pre>
+<pre><code># scripts/register_client.py
+"""Register an integration client. Prints the API key and webhook secret ONCE.
+
+Example:
+  python scripts/register_client.py --name jeevacare \
+      --webhook-url https://jeevacare.example/api/webhook/claramed-callback \
+      --allowed-host res.cloudinary.com
+"""
+import argparse
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from backend.database.connection import get_db_context  # noqa: E402
+from backend.services.client_registry import register_client  # noqa: E402
+
+
+def main() -&gt; int:
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--name", required=True)
+    p.add_argument("--webhook-url", required=True)
+    p.add_argument("--allowed-host", action="append", required=True, dest="hosts")
+    p.add_argument("--description")
+    args = p.parse_args()
+    try:
+        with get_db_context() as db:
+            reg = register_client(db, name=args.name, webhook_url=args.webhook_url,
+                                  allowed_file_hosts=args.hosts, description=args.description)
+            print(f"Registered client: {reg.client.client_name}")
+            print(f"API key (shown once):        {reg.api_key}")
+            print(f"Webhook secret (shown once): {reg.webhook_secret}")
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())</code></pre>
+<pre><code># tests/conftest.py  (append)
+from backend.services.client_registry import register_client  # noqa: E402
+
+
+@pytest.fixture
+def make_client(db):
+    def _make(name="jeevacare", **overrides):
+        params = dict(
+            name=name,
+            webhook_url="https://jeevacare.test/api/webhook/claramed-callback",
+            allowed_file_hosts=["res.cloudinary.com"],
+        )
+        params.update(overrides)
+        return register_client(db, **params)
+    return _make
+
+
+@pytest.fixture
+def auth_headers():
+    return lambda api_key: {"Authorization": f"Bearer {api_key}"}</code></pre>
+
+<p class="step">- [ ] Step 4: Run to verify it passes, and smoke the CLI</p>
+<p>Run: <code>python -m pytest tests/unit/test_client_registry.py -v &amp;&amp; python scripts/register_client.py --help | head -3</code><br>Expected: 5 passed; usage text printed.</p>
+
+<p class="step">- [ ] Step 5: Commit</p>
+<pre><code>git add backend/services/client_registry.py scripts/register_client.py tests
+git commit -m "feat: integration client registration service and CLI"</code></pre>
+</div>
+
+<!-- ============================ T4 ============================ -->
+<div class="task">
+<h3>Task 4: Make authentication mandatory on every analysis route</h3>
+<p class="meta"><strong>Requirements:</strong> R1, R10</p>
+<p><strong>Files:</strong></p>
+<ul>
+<li>Modify: <code>backend/api/routes/analyses.py</code> (6 occurrences of the optional dependency)</li>
+<li>Modify: <code>backend/core/security.py:28-30</code> (constant-time compare)</li>
+<li>Modify: <code>frontend/api_client.py</code> (send <code>CLARAMED_API_KEY</code>)</li>
+<li>Test: <code>tests/api/test_auth_required.py</code>, <code>tests/unit/test_frontend_client.py</code></li>
+</ul>
+<p><strong>Relies on:</strong></p>
+<ul>
+<li>EXISTS: backend/api/dependencies.py require_authentication</li>
+<li>EXISTS: backend/api/dependencies.py require_scope</li>
+<li>EXISTS: backend/core/security.py verify_api_key</li>
+</ul>
+<p><strong>Interfaces:</strong> Produces: every <code>/api/v1/analyses…</code> route returns 401 without a valid <code>Authorization: Bearer</code> key.</p>
+
+<p class="step">- [ ] Step 1: Write the failing test</p>
+<pre><code># tests/api/test_auth_required.py
+import uuid
+
+import pytest
+
+ID = str(uuid.uuid4())
+ROUTES = [
+    ("post", "/api/v1/analyses", {"json": {"input_text": "headache", "language": "English"}}),
+    ("get", "/api/v1/analyses", {}),
+    ("get", f"/api/v1/analyses/{ID}", {}),
+    ("get", f"/api/v1/analyses/{ID}/results", {}),
+    ("post", f"/api/v1/analyses/{ID}/documents", {"files": {"file": ("a.pdf", b"%PDF-1.4", "application/pdf")}}),
+    ("post", f"/api/v1/analyses/{ID}/images", {"files": {"file": ("a.png", b"\x89PNG", "image/png")}}),
+]
+
+
+@pytest.mark.parametrize("method,path,kwargs", ROUTES)
+def test_anonymous_request_is_rejected(api_client, method, path, kwargs):
+    assert getattr(api_client, method)(path, **kwargs).status_code == 401
+
+
+def test_valid_key_is_accepted(api_client, make_client, auth_headers):
+    reg = make_client()
+    r = api_client.get("/api/v1/analyses", headers=auth_headers(reg.api_key))
+    assert r.status_code == 200
+
+
+def test_wrong_key_is_rejected(api_client, make_client, auth_headers):
+    make_client()
+    r = api_client.get("/api/v1/analyses", headers=auth_headers("sk_claramed_wrong"))
+    assert r.status_code == 401</code></pre>
+
+<p class="step">- [ ] Step 2: Run to verify it fails</p>
+<p>Run: <code>python -m pytest tests/api/test_auth_required.py -v</code><br>Expected: the 6 anonymous cases FAIL (status is not 401: 200/201/404/422).</p>
+
+<p class="step">- [ ] Step 3: Implement</p>
+<p>In <code>backend/api/routes/analyses.py</code>, change the import and replace all six dependencies (use replace-all):</p>
+<pre><code>from backend.api.dependencies import require_authentication, check_analysis_access
+
+# every occurrence of:
+    client: Optional[IntegrationClient] = Depends(get_current_client),
+# becomes:
+    client: IntegrationClient = Depends(require_authentication),</code></pre>
+<pre><code># backend/core/security.py
+import hmac  # add to imports
+
+def verify_api_key(plain_key: str, hashed_key: str) -&gt; bool:
+    """Verify an API key against its hash (constant-time)."""
+    return hmac.compare_digest(hash_api_key(plain_key), hashed_key)</code></pre>
+<p>Then in <code>analyses.py</code> the guards <code>if client and …</code> are now always true for <code>client</code>; leave them (behaviour is identical) to keep the diff small.</p>
+
+<p class="step">- [ ] Step 4: Keep the bundled Streamlit client working</p>
+<p><code>frontend/api_client.py</code> (class <code>ClaraMedAPIClient</code>) calls <code>/api/v1/analyses</code>, <code>/documents</code> and <code>/images</code> with no credentials, so mandatory auth would break it. Make it send the key from the environment:</p>
+<pre><code># frontend/api_client.py
+BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
+API_KEY = os.getenv("CLARAMED_API_KEY")
+
+class ClaraMedAPIClient:
+    def __init__(self, base_url: str = BACKEND_URL, api_key: Optional[str] = API_KEY):
+        self.base_url = base_url.rstrip("/")
+        self.session = requests.Session()
+        if api_key:
+            self.session.headers["Authorization"] = f"Bearer {api_key}"</code></pre>
+<p>Add a test in <code>tests/unit/test_frontend_client.py</code>: <code>ClaraMedAPIClient(api_key="k").session.headers["Authorization"] == "Bearer k"</code>, and without a key no <code>Authorization</code> header is set. Add <code>CLARAMED_API_KEY=</code> to <code>.env.example</code> with a comment: register a client for the Streamlit UI with <code>scripts/register_client.py</code>. Note this in the commit message as a breaking change.</p>
+
+<p class="step">- [ ] Step 5: Run to verify it passes</p>
+<p>Run: <code>python -m pytest tests/api tests/unit/test_frontend_client.py -v</code><br>Expected: all pass, including <code>test_health</code>.</p>
+
+<p class="step">- [ ] Step 6: Commit</p>
+<pre><code>git add backend frontend tests .env.example
+git commit -m "fix!: require API-key authentication on all analysis routes (Streamlit client now sends CLARAMED_API_KEY)"</code></pre>
+</div>
+
+<!-- ============================ T5 ============================ -->
+<div class="task">
+<h3>Task 5: Safe URL fetcher</h3>
+<p class="meta"><strong>Requirements:</strong> R5 · Deviations: D6</p>
+<p><strong>Files:</strong></p>
+<ul>
+<li>Create: <code>backend/services/url_fetcher.py</code></li>
+<li>Test: <code>tests/unit/test_url_fetcher.py</code></li>
+</ul>
+<p><strong>Relies on:</strong> <code>httpx</code> (in <code>requirements.txt</code>); standard library <code>ipaddress</code>, <code>socket</code>.</p>
+<p><strong>Interfaces:</strong><br>
+Produces <code>FetchError(code: str, message: str)</code> with codes <code>invalid_scheme</code>, <code>invalid_url</code>, <code>host_not_allowed</code>, <code>blocked_address</code>, <code>redirect_limit</code>, <code>too_large</code>, <code>bad_content</code>, <code>fetch_failed</code>;
+<code>FetchedFile(content: bytes, kind_detected: str, extension: str)</code> where <code>kind_detected</code> is <code>"png"|"jpeg"|"pdf"</code>;
+<code>fetch_file(url: str, *, allowed_hosts: list[str], kind: str, max_bytes: int, client: httpx.Client | None = None, resolver=None, max_redirects: int = 3) -&gt; FetchedFile</code> where <code>kind</code> is <code>"radiology"</code> (PNG/JPEG) or <code>"document"</code> (PDF).</p>
+
+<p class="step">- [ ] Step 1: Write the failing test</p>
+<pre><code># tests/unit/test_url_fetcher.py
+import httpx
+import pytest
+
+from backend.services.url_fetcher import FetchError, fetch_file
+
+PNG = b"\x89PNG\r\n\x1a\n" + b"0" * 64
+JPEG = b"\xff\xd8\xff\xe0" + b"0" * 64
+PDF = b"%PDF-1.4\n" + b"0" * 64
+PUBLIC = lambda host: ["93.184.216.34"]
+
+
+def _client(handler):
+    return httpx.Client(transport=httpx.MockTransport(handler), follow_redirects=False)
+
+
+def _ok(content, ctype="image/png"):
+    return lambda req: httpx.Response(200, content=content, headers={"content-type": ctype})
+
+
+def fetch(url="https://res.cloudinary.com/a/x.png", handler=None, kind="radiology",
+          hosts=("res.cloudinary.com",), max_bytes=1024, resolver=PUBLIC):
+    return fetch_file(url, allowed_hosts=list(hosts), kind=kind, max_bytes=max_bytes,
+                      client=_client(handler or _ok(PNG)), resolver=resolver)
+
+
+def test_downloads_png():
+    f = fetch()
+    assert f.content == PNG and f.kind_detected == "png" and f.extension == ".png"
+
+
+def test_downloads_jpeg_and_pdf():
+    assert fetch(handler=_ok(JPEG)).kind_detected == "jpeg"
+    assert fetch("https://res.cloudinary.com/a/r.pdf", _ok(PDF), kind="document").kind_detected == "pdf"
+
+
+@pytest.mark.parametrize("url,code", [
+    ("http://res.cloudinary.com/a.png", "invalid_scheme"),
+    ("https://user:pw@res.cloudinary.com/a.png", "invalid_url"),
+    ("https://res.cloudinary.com:8443/a.png", "invalid_url"),
+    ("https://evil.example/a.png", "host_not_allowed"),
+    ("not a url", "invalid_url"),
+])
+def test_rejects_bad_urls_without_any_request(url, code):
+    def boom(req):
+        raise AssertionError("no request should be made")
+    with pytest.raises(FetchError) as e:
+        fetch(url, handler=boom)
+    assert e.value.code == code
+
+
+def test_wildcard_host_matches_subdomain_only():
+    fetch("https://a.cdn.test/x.png", hosts=("*.cdn.test",))
+    with pytest.raises(FetchError) as e:
+        fetch("https://cdn.test/x.png", hosts=("*.cdn.test",))
+    assert e.value.code == "host_not_allowed"
+
+
+@pytest.mark.parametrize("ip", ["10.0.0.5", "127.0.0.1", "169.254.169.254", "::1", "192.168.1.9", "::ffff:127.0.0.1"])
+def test_blocks_non_public_addresses(ip):
+    with pytest.raises(FetchError) as e:
+        fetch(resolver=lambda h: [ip])
+    assert e.value.code == "blocked_address"
+
+
+def test_blocks_when_any_resolved_address_is_private():
+    with pytest.raises(FetchError) as e:
+        fetch(resolver=lambda h: ["93.184.216.34", "10.0.0.5"])
+    assert e.value.code == "blocked_address"
+
+
+def test_follows_redirect_to_allowed_host():
+    def handler(req):
+        if req.url.path == "/a.png":
+            return httpx.Response(302, headers={"location": "https://res.cloudinary.com/b.png"})
+        return httpx.Response(200, content=PNG)
+    assert fetch(handler=handler).content == PNG
+
+
+def test_rejects_redirect_to_disallowed_host():
+    def handler(req):
+        return httpx.Response(302, headers={"location": "https://evil.example/x.png"})
+    with pytest.raises(FetchError) as e:
+        fetch(handler=handler)
+    assert e.value.code == "host_not_allowed"
+
+
+def test_redirect_loop_is_limited():
+    def handler(req):
+        return httpx.Response(302, headers={"location": "https://res.cloudinary.com/a.png"})
+    with pytest.raises(FetchError) as e:
+        fetch(handler=handler)
+    assert e.value.code == "redirect_limit"
+
+
+def test_rejects_oversize_by_header_and_by_stream():
+    big = b"\x89PNG\r\n\x1a\n" + b"0" * 5000
+    with pytest.raises(FetchError) as e:
+        fetch(handler=_ok(big), max_bytes=1024)
+    assert e.value.code == "too_large"
+
+    def chunked(req):
+        return httpx.Response(200, stream=httpx.ByteStream(big))
+    with pytest.raises(FetchError) as e2:
+        fetch(handler=chunked, max_bytes=1024)
+    assert e2.value.code == "too_large"
+
+
+def test_rejects_content_that_is_not_the_claimed_kind():
+    with pytest.raises(FetchError) as e:
+        fetch(handler=_ok(b"&lt;html&gt;nope&lt;/html&gt;", "image/png"))
+    assert e.value.code == "bad_content"
+    with pytest.raises(FetchError) as e2:
+        fetch("https://res.cloudinary.com/a.pdf", _ok(PNG), kind="document")
+    assert e2.value.code == "bad_content"
+
+
+def test_non_200_is_fetch_failed():
+    with pytest.raises(FetchError) as e:
+        fetch(handler=lambda r: httpx.Response(403))
+    assert e.value.code == "fetch_failed"</code></pre>
+
+<p class="step">- [ ] Step 2: Run to verify it fails</p>
+<p>Run: <code>python -m pytest tests/unit/test_url_fetcher.py -v</code><br>Expected: FAIL with <code>ModuleNotFoundError: backend.services.url_fetcher</code>.</p>
+
+<p class="step">- [ ] Step 3: Implement</p>
+<pre><code># backend/services/url_fetcher.py
+"""Download a client-supplied file URL safely (SSRF-hardened).
+
+Known limit (D6): DNS is resolved and checked, then httpx connects by hostname, so a
+DNS-rebinding window remains. The per-client host allowlist is the primary control.
+"""
+import ipaddress
+import socket
+from dataclasses import dataclass
+from urllib.parse import urljoin, urlparse
+
+import httpx
+
+
+class FetchError(Exception):
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+@dataclass
+class FetchedFile:
+    content: bytes
+    kind_detected: str  # "png" | "jpeg" | "pdf"
+    extension: str
+
+
+_MAGIC = [
+    (b"\x89PNG\r\n\x1a\n", "png", ".png"),
+    (b"\xff\xd8\xff", "jpeg", ".jpg"),
+    (b"%PDF-", "pdf", ".pdf"),
+]
+_ALLOWED = {"radiology": {"png", "jpeg"}, "document": {"pdf"}}
+_TIMEOUT = httpx.Timeout(15.0, connect=5.0)
+
+
+def host_allowed(host: str, allowed: list[str]) -&gt; bool:
+    host = host.lower()
+    for pattern in allowed:
+        pattern = pattern.lower()
+        if pattern.startswith("*."):
+            if host.endswith(pattern[1:]) and host != pattern[2:]:
+                return True
+        elif host == pattern:
+            return True
+    return False
+
+
+def default_resolver(host: str) -&gt; list[str]:
+    try:
+        infos = socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)
+    except socket.gaierror as exc:
+        raise FetchError("fetch_failed", f"cannot resolve host: {exc}") from exc
+    return [info[4][0] for info in infos]
+
+
+def _is_public(ip_text: str) -&gt; bool:
+    ip = ipaddress.ip_address(ip_text)
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    return ip.is_global
+
+
+def _validate(url: str, allowed_hosts: list[str], resolver) -&gt; str:
+    try:
+        parsed = urlparse(url)
+        host, port = parsed.hostname, parsed.port
+    except ValueError as exc:
+        raise FetchError("invalid_url", "URL is not valid") from exc
+    if parsed.scheme != "https":
+        raise FetchError("invalid_scheme", "only https URLs are accepted")
+    if not host or parsed.username or parsed.password or port not in (None, 443):
+        raise FetchError("invalid_url", "URL must be a plain https URL on the default port")
+    if not host_allowed(host, allowed_hosts):
+        raise FetchError("host_not_allowed", "host is not in the client's allowlist")
+    addresses = resolver(host)
+    if not addresses or not all(_is_public(a) for a in addresses):
+        raise FetchError("blocked_address", "host resolves to a non-public address")
+    return url
+
+
+def _detect(content: bytes, kind: str) -&gt; tuple[str, str]:
+    for magic, name, ext in _MAGIC:
+        if content.startswith(magic):
+            if name in _ALLOWED[kind]:
+                return name, ext
+            break
+    raise FetchError("bad_content", f"file content is not a valid {kind} file")
+
+
+def fetch_file(
+    url: str,
+    *,
+    allowed_hosts: list[str],
+    kind: str,
+    max_bytes: int,
+    client: httpx.Client | None = None,
+    resolver=None,
+    max_redirects: int = 3,
+) -&gt; FetchedFile:
+    if kind not in _ALLOWED:
+        raise ValueError(f"unknown kind: {kind}")
+    resolver = resolver or default_resolver
+    owns_client = client is None
+    client = client or httpx.Client(timeout=_TIMEOUT, follow_redirects=False)
+    try:
+        current = url
+        for _hop in range(max_redirects + 1):
+            _validate(current, allowed_hosts, resolver)
+            try:
+                with client.stream("GET", current) as response:
+                    if response.is_redirect:
+                        location = response.headers.get("location")
+                        if not location:
+                            raise FetchError("fetch_failed", "redirect without location")
+                        current = urljoin(current, location)
+                        continue
+                    if response.status_code != 200:
+                        raise FetchError("fetch_failed", f"upstream returned {response.status_code}")
+                    declared = response.headers.get("content-length")
+                    if declared and declared.isdigit() and int(declared) &gt; max_bytes:
+                        raise FetchError("too_large", "file exceeds the size limit")
+                    buffer = bytearray()
+                    for chunk in response.iter_bytes():
+                        buffer.extend(chunk)
+                        if len(buffer) &gt; max_bytes:
+                            raise FetchError("too_large", "file exceeds the size limit")
+            except httpx.HTTPError as exc:
+                raise FetchError("fetch_failed", f"download failed: {type(exc).__name__}") from exc
+            name, ext = _detect(bytes(buffer), kind)
+            return FetchedFile(content=bytes(buffer), kind_detected=name, extension=ext)
+        raise FetchError("redirect_limit", "too many redirects")
+    finally:
+        if owns_client:
+            client.close()</code></pre>
+
+<p class="step">- [ ] Step 4: Run to verify it passes</p>
+<p>Run: <code>python -m pytest tests/unit/test_url_fetcher.py -v</code><br>Expected: all pass. If the chunked-stream oversize case does not trigger, check that <code>iter_bytes</code> is used (not <code>response.content</code>).</p>
+
+<p class="step">- [ ] Step 5: Commit</p>
+<pre><code>git add backend/services/url_fetcher.py tests/unit/test_url_fetcher.py
+git commit -m "feat: SSRF-hardened URL fetcher with host allowlist and magic-byte checks"</code></pre>
+</div>
+
+<!-- ============================ T6 ============================ -->
+<div class="task">
+<h3>Task 6: Audit helper, submit service, and <code>/analyze</code> + <code>/status</code> routes</h3>
+<p class="meta"><strong>Requirements:</strong> R1, R2, R3, R4, R5, R11, R12</p>
+<p><strong>Files:</strong></p>
+<ul>
+<li>Create: <code>backend/services/audit_service.py</code></li>
+<li>Create: <code>backend/schemas/integration.py</code></li>
+<li>Create: <code>backend/services/integration_service.py</code></li>
+<li>Create: <code>backend/api/routes/integration.py</code></li>
+<li>Modify: <code>backend/main.py:164</code> (mount router)</li>
+<li>Test: <code>tests/api/test_integration_analyze.py</code></li>
+</ul>
+<p><strong>Relies on:</strong></p>
+<ul>
+<li>EXISTS: backend/api/dependencies.py require_scope</li>
+<li>EXISTS: backend/services/storage_service.py StorageService</li>
+<li>EXISTS: backend/workers/tasks.py process_radiology_async</li>
+<li>EXISTS: backend/workers/tasks.py process_document_async</li>
+<li>EXISTS: backend/models/audit.py AuditEvent</li>
+<li>EXISTS: backend/models/result.py ResultType</li>
+</ul>
+<p><strong>Interfaces:</strong><br>
+Consumes <code>fetch_file</code>/<code>FetchError</code> (T5), <code>make_client</code>/<code>auth_headers</code> (T3), model columns (T1).<br>
+Produces:<br>
+<code>record_event(db, *, action: str, resource_type: str, resource_id: str | None, outcome: str, client_id=None, client_name: str | None = None, request_id: str | None = None, error: str | None = None, metadata: dict | None = None) -&gt; None</code> (adds and commits an <code>AuditEvent</code>);<br>
+<code>submit_analysis(db, client: IntegrationClient, req: AnalyzeRequest) -&gt; tuple[MedicalAnalysis, bool]</code> (second value = newly created);<br>
+<code>build_results_payload(db, analysis) -&gt; dict | None</code> returning <code>{"findings": [{"label": str, "score": float}], "summary": str, "confidence": float | None, "disclaimer": str}</code> for radiology and <code>{"explanation": str, "findings": [...], "summary": str, "confidence": None, "disclaimer": str}</code> for documents, or <code>None</code> unless the analysis is completed;<br>
+<code>status_label(analysis) -&gt; str</code> mapping pending→<code>queued</code>, processing→<code>processing</code>, completed→<code>completed</code>, failed→<code>failed</code>;<br>
+Routes: <code>POST /api/v1/analyze</code> (202, scope <code>analysis:create</code>) body <code>{type, radiologyId | documentId, fileUrl, patientRef?, hospitalRef?, metadata?}</code> → <code>{jobId, status}</code>; <code>GET /api/v1/status/{jobId}</code> (scope <code>analysis:read</code>) → <code>{jobId, status, radiologyId | documentId, results, deliveryStatus}</code>.<br>
+Error body for intake failures: HTTP 422 <code>{"error": {"code": "&lt;FetchError.code&gt;", "message": "..."}}</code>. Kill switch off → 503.</p>
+
+<p class="step">- [ ] Step 1: Write the failing test</p>
+<pre><code># tests/api/test_integration_analyze.py
+import uuid
+from unittest.mock import MagicMock
+
+import pytest
+
+from backend.core.config import settings
+from backend.models.analysis import AnalysisStatus, MedicalAnalysis
+from backend.models.document import UploadedDocument
+from backend.models.result import AnalysisResult, ResultType
+from backend.services import integration_service
+from backend.services.url_fetcher import FetchedFile, FetchError
+
+PNG = FetchedFile(content=b"\x89PNG\r\n\x1a\n" + b"0" * 32, kind_detected="png", extension=".png")
+PDF = FetchedFile(content=b"%PDF-1.4\n" + b"0" * 32, kind_detected="pdf", extension=".pdf")
+BODY = {"type": "radiology", "radiologyId": "rad-1",
+        "fileUrl": "https://res.cloudinary.com/x/xray.png",
+        "patientRef": "JV-PAT-1", "hospitalRef": "JV-HOSP-1"}
+
+
+@pytest.fixture
+def tasks(monkeypatch):
+    rad, doc = MagicMock(), MagicMock()
+    monkeypatch.setattr(integration_service, "process_radiology_async", rad)
+    monkeypatch.setattr(integration_service, "process_document_async", doc)
+    return rad, doc
+
+
+@pytest.fixture
+def fetched(monkeypatch):
+    fake = MagicMock(return_value=PNG)
+    monkeypatch.setattr(integration_service, "fetch_file", fake)
+    return fake
+
+
+@pytest.fixture
+def auth(make_client, auth_headers):
+    reg = make_client()
+    return reg, auth_headers(reg.api_key)
+
+
+def test_anonymous_is_401(api_client):
+    assert api_client.post("/api/v1/analyze", json=BODY).status_code == 401
+    assert api_client.get(f"/api/v1/status/{uuid.uuid4()}").status_code == 401
+
+
+def test_missing_scope_is_403(api_client, make_client, auth_headers):
+    reg = make_client(scopes=["analysis:read"])
+    r = api_client.post("/api/v1/analyze", json=BODY, headers=auth_headers(reg.api_key))
+    assert r.status_code == 403
+
+
+@pytest.mark.parametrize("patch", [
+    {"radiologyId": None, "documentId": None},                 # neither id
+    {"documentId": "d1"},                                      # both ids
+    {"type": "document", "radiologyId": "rad-1"},              # id does not match type
+    {"fileUrl": "not-a-url"},
+])
+def test_invalid_body_is_422(api_client, auth, tasks, fetched, patch):
+    _, headers = auth
+    body = {**BODY, **patch}
+    body = {k: v for k, v in body.items() if v is not None}
+    assert api_client.post("/api/v1/analyze", json=body, headers=headers).status_code == 422
+
+
+def test_radiology_submit_creates_job_and_enqueues(api_client, auth, tasks, fetched, db, storage_dir):
+    reg, headers = auth
+    r = api_client.post("/api/v1/analyze", json=BODY, headers=headers)
+    assert r.status_code == 202
+    data = r.json()
+    assert data["status"] == "queued"
+    analysis = db.get(MedicalAnalysis, uuid.UUID(data["jobId"]))
+    assert analysis.requesting_client_id == reg.client.id
+    assert analysis.external_record_kind == "radiology" and analysis.external_record_id == "rad-1"
+    assert analysis.external_patient_reference == "JV-PAT-1"
+    assert analysis.delivery_status == "pending"
+    docs = db.query(UploadedDocument).filter_by(analysis_id=analysis.id).all()
+    assert len(docs) == 1 and (storage_dir / docs[0].storage_key).exists()
+    tasks[0].delay.assert_called_once_with(str(analysis.id), str(docs[0].id))
+    fetched.assert_called_once()
+    assert fetched.call_args.kwargs["allowed_hosts"] == ["res.cloudinary.com"]
+    assert fetched.call_args.kwargs["kind"] == "radiology"
+
+
+def test_document_submit_enqueues_document_task(api_client, auth, tasks, monkeypatch):
+    monkeypatch.setattr(integration_service, "fetch_file", MagicMock(return_value=PDF))
+    _, headers = auth
+    body = {"type": "document", "documentId": "doc-9", "fileUrl": "https://res.cloudinary.com/x/r.pdf"}
+    r = api_client.post("/api/v1/analyze", json=body, headers=headers)
+    assert r.status_code == 202
+    tasks[1].delay.assert_called_once()
+    tasks[0].delay.assert_not_called()
+
+
+def test_resubmit_is_idempotent(api_client, auth, tasks, fetched, db):
+    _, headers = auth
+    first = api_client.post("/api/v1/analyze", json=BODY, headers=headers).json()
+    second = api_client.post("/api/v1/analyze", json=BODY, headers=headers)
+    assert second.status_code == 202 and second.json()["jobId"] == first["jobId"]
+    assert db.query(MedicalAnalysis).count() == 1
+    assert fetched.call_count == 1 and tasks[0].delay.call_count == 1
+
+
+def test_intake_failure_creates_nothing(api_client, auth, tasks, monkeypatch, db):
+    monkeypatch.setattr(integration_service, "fetch_file",
+                        MagicMock(side_effect=FetchError("host_not_allowed", "nope")))
+    _, headers = auth
+    r = api_client.post("/api/v1/analyze", json=BODY, headers=headers)
+    assert r.status_code == 422
+    assert r.json()["error"]["code"] == "host_not_allowed"
+    assert db.query(MedicalAnalysis).count() == 0
+    tasks[0].delay.assert_not_called()
+
+
+def test_kill_switch_returns_503(api_client, auth, tasks, fetched, monkeypatch):
+    monkeypatch.setattr(settings, "CLARAMED_INTEGRATION_ENABLED", False)
+    _, headers = auth
+    assert api_client.post("/api/v1/analyze", json=BODY, headers=headers).status_code == 503
+
+
+def test_status_is_scoped_to_owner(api_client, make_client, auth_headers, tasks, fetched):
+    a, b = make_client("a"), make_client("b")
+    job = api_client.post("/api/v1/analyze", json=BODY, headers=auth_headers(a.api_key)).json()["jobId"]
+    assert api_client.get(f"/api/v1/status/{job}", headers=auth_headers(b.api_key)).status_code == 404
+    assert api_client.get("/api/v1/status/not-a-uuid", headers=auth_headers(a.api_key)).status_code == 404
+    mine = api_client.get(f"/api/v1/status/{job}", headers=auth_headers(a.api_key))
+    assert mine.status_code == 200 and mine.json()["status"] == "queued"
+    assert mine.json()["radiologyId"] == "rad-1" and mine.json()["results"] is None
+
+
+def test_status_returns_results_when_completed(api_client, auth, tasks, fetched, db):
+    _, headers = auth
+    job = api_client.post("/api/v1/analyze", json=BODY, headers=headers).json()["jobId"]
+    analysis = db.get(MedicalAnalysis, uuid.UUID(job))
+    analysis.status = AnalysisStatus.COMPLETED
+    db.add(AnalysisResult(analysis_id=analysis.id, result_type=ResultType.RADIOLOGY_INFERENCE, content={
+        "modality": "chest_xray", "model_name": "densenet121-res224-all", "disclaimer": "Not a diagnosis.",
+        "findings": [{"label": "Edema", "model_score": 0.81}, {"label": "Atelectasis", "model_score": 0.2}],
+    }))
+    db.commit()
+    body = api_client.get(f"/api/v1/status/{job}", headers=headers).json()
+    assert body["status"] == "completed"
+    assert body["results"]["findings"][0] == {"label": "Edema", "score": 0.81}
+    assert body["results"]["confidence"] == 0.81
+    assert "Edema" in body["results"]["summary"]
+    assert body["results"]["disclaimer"] == "Not a diagnosis."</code></pre>
+
+<p class="step">- [ ] Step 2: Run to verify it fails</p>
+<p>Run: <code>python -m pytest tests/api/test_integration_analyze.py -v</code><br>Expected: FAIL with <code>ImportError: cannot import name 'integration_service'</code>.</p>
+
+<p class="step">- [ ] Step 3: Implement the audit helper and schemas</p>
+<pre><code># backend/services/audit_service.py
+"""Write AuditEvent rows. Never put patient references in `metadata`."""
+from sqlalchemy.orm import Session
+
+from backend.models.audit import AuditEvent
+
+
+def record_event(
+    db: Session,
+    *,
+    action: str,
+    resource_type: str,
+    resource_id: str | None,
+    outcome: str,
+    client_id=None,
+    client_name: str | None = None,
+    request_id: str | None = None,
+    error: str | None = None,
+    metadata: dict | None = None,
+) -&gt; None:
+    db.add(AuditEvent(
+        request_id=request_id or "system",
+        requesting_client_id=client_id,
+        requesting_client_name=client_name,
+        action=action,
+        resource_type=resource_type,
+        resource_id=resource_id,
+        outcome=outcome,
+        error_message=(error or None) and error[:500],
+        event_metadata=metadata,
+    ))
+    db.commit()</code></pre>
+<pre><code># backend/schemas/integration.py
+from typing import Any, Literal, Optional
+
+from pydantic import BaseModel, Field, HttpUrl, model_validator
+
+
+class AnalyzeRequest(BaseModel):
+    type: Literal["radiology", "document"]
+    radiologyId: Optional[str] = Field(default=None, min_length=1, max_length=255)
+    documentId: Optional[str] = Field(default=None, min_length=1, max_length=255)
+    fileUrl: HttpUrl
+    patientRef: Optional[str] = Field(default=None, max_length=255)
+    hospitalRef: Optional[str] = Field(default=None, max_length=255)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _exactly_one_matching_id(self):
+        expected = "radiologyId" if self.type == "radiology" else "documentId"
+        other = "documentId" if expected == "radiologyId" else "radiologyId"
+        if getattr(self, expected) is None or getattr(self, other) is not None:
+            raise ValueError(f"type '{self.type}' requires {expected} and must not include {other}")
+        return self
+
+    @property
+    def record_id(self) -&gt; str:
+        return self.radiologyId or self.documentId
+
+
+class AnalyzeResponse(BaseModel):
+    jobId: str
+    status: str</code></pre>
+
+<p class="step">- [ ] Step 4: Implement the service</p>
+<pre><code># backend/services/integration_service.py
+"""Submit/status logic for the client integration API."""
+import hashlib
+import tempfile
+from datetime import datetime
+from pathlib import Path
+
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
+
+from backend.core.config import settings
+from backend.core.logging import get_logger
+from backend.models.analysis import AnalysisStatus, AnalysisType, MedicalAnalysis
+from backend.models.document import DocumentType, UploadedDocument
+from backend.models.integration_client import IntegrationClient
+from backend.models.result import AnalysisResult, ResultType
+from backend.schemas.integration import AnalyzeRequest
+from backend.services.audit_service import record_event
+from backend.services.storage_service import StorageService
+from backend.services.url_fetcher import fetch_file
+from backend.workers.tasks import process_document_async, process_radiology_async
+
+logger = get_logger(__name__)
+
+_STATUS = {
+    AnalysisStatus.PENDING: "queued",
+    AnalysisStatus.PROCESSING: "processing",
+    AnalysisStatus.COMPLETED: "completed",
+    AnalysisStatus.FAILED: "failed",
+}
+_DOC_TYPE = {"png": DocumentType.IMAGE_PNG, "jpeg": DocumentType.IMAGE_JPEG, "pdf": DocumentType.PDF}
+
+
+def status_label(analysis: MedicalAnalysis) -&gt; str:
+    return _STATUS[analysis.status]
+
+
+def _find_existing(db: Session, client: IntegrationClient, kind: str, record_id: str):
+    return db.query(MedicalAnalysis).filter_by(
+        requesting_client_id=client.id, external_record_kind=kind, external_record_id=record_id
+    ).first()
+
+
+def submit_analysis(db: Session, client: IntegrationClient, req: AnalyzeRequest):
+    """Return (analysis, created). Raises FetchError on intake failure (nothing is persisted)."""
+    existing = _find_existing(db, client, req.type, req.record_id)
+    if existing:
+        return existing, False
+
+    fetched = fetch_file(
+        str(req.fileUrl),
+        allowed_hosts=list(client.allowed_file_hosts or []),
+        kind=req.type,
+        max_bytes=settings.MAX_UPLOAD_SIZE_MB * 1024 * 1024,
+    )
+
+    analysis = MedicalAnalysis(
+        analysis_type=AnalysisType.XRAY if req.type == "radiology" else AnalysisType.DOCUMENT,
+        status=AnalysisStatus.PENDING,
+        input_data={"metadata": req.metadata},
+        external_patient_reference=req.patientRef,
+        external_hospital_reference=req.hospitalRef,
+        external_system=client.client_name,
+        requesting_client_id=client.id,
+        external_record_kind=req.type,
+        external_record_id=req.record_id,
+        delivery_status="pending",
+    )
+    db.add(analysis)
+    try:
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        return _find_existing(db, client, req.type, req.record_id), False
+
+    storage = StorageService()
+    filename = f"{req.record_id}{fetched.extension}"
+    key = storage.generate_storage_key(
+        analysis_id=str(analysis.id), filename=filename,
+        prefix="images" if req.type == "radiology" else "documents",
+    )
+    with tempfile.NamedTemporaryFile(delete=False, suffix=fetched.extension) as tmp:
+        tmp.write(fetched.content)
+        tmp_path = Path(tmp.name)
+    try:
+        stored = storage.save_file(tmp_path, key)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+    document = UploadedDocument(
+        analysis_id=analysis.id,
+        filename=key.split("/")[-1],
+        original_filename=filename[:255],
+        file_type=_DOC_TYPE[fetched.kind_detected],
+        file_size=len(fetched.content),
+        checksum=hashlib.sha256(fetched.content).hexdigest(),
+        storage_key=key,
+        storage_provider=stored["storage_provider"],
+    )
+    db.add(document)
+    db.commit()  # must be committed before the worker can see it
+
+    task = process_radiology_async if req.type == "radiology" else process_document_async
+    task.delay(str(analysis.id), str(document.id))
+    record_event(db, action="analysis_submitted", resource_type="analysis", resource_id=str(analysis.id),
+                 outcome="success", client_id=client.id, client_name=client.client_name,
+                 metadata={"kind": req.type})
+    return analysis, True
+
+
+def _radiology_payload(result: AnalysisResult) -&gt; dict:
+    content = result.content
+    findings = sorted(
+        ({"label": f["label"], "score": float(f["model_score"])} for f in content.get("findings", [])),
+        key=lambda f: f["score"], reverse=True,
+    )
+    top = ", ".join(f"{f['label']} ({f['score']:.2f})" for f in findings[:3]) or "no findings"
+    return {
+        "findings": findings,
+        "summary": f"Highest model scores: {top}.",
+        "confidence": findings[0]["score"] if findings else None,
+        "disclaimer": content.get("disclaimer", ""),
+    }
+
+
+def build_results_payload(db: Session, analysis: MedicalAnalysis) -&gt; dict | None:
+    if analysis.status != AnalysisStatus.COMPLETED:
+        return None
+    results = db.query(AnalysisResult).filter_by(analysis_id=analysis.id).all()
+    by_type = {r.result_type: r for r in results}
+    if ResultType.RADIOLOGY_INFERENCE in by_type:
+        return _radiology_payload(by_type[ResultType.RADIOLOGY_INFERENCE])
+    explanation = by_type.get(ResultType.EXPLANATION)
+    structured = by_type.get(ResultType.STRUCTURED_FINDINGS)
+    text = explanation.content.get("explanation", "") if explanation else ""
+    return {
+        "explanation": text,
+        "findings": structured.content.get("findings", []) if structured else [],
+        "summary": text[:500],
+        "confidence": None,
+        "disclaimer": "Educational information only; not a medical diagnosis.",
+    }</code></pre>
+
+<p class="step">- [ ] Step 5: Implement the routes and mount them</p>
+<pre><code># backend/api/routes/integration.py
+import uuid
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import JSONResponse
+from sqlalchemy.orm import Session
+
+from backend.api.dependencies import require_scope
+from backend.core.config import settings
+from backend.database.connection import get_db
+from backend.models.analysis import MedicalAnalysis
+from backend.models.integration_client import IntegrationClient
+from backend.schemas.integration import AnalyzeRequest, AnalyzeResponse
+from backend.services import integration_service as svc
+from backend.services.url_fetcher import FetchError
+
+router = APIRouter()
+
+
+# Plain `def` (not async): the URL download is blocking and runs in FastAPI's threadpool.
+@router.post("/analyze", response_model=AnalyzeResponse, status_code=status.HTTP_202_ACCEPTED)
+def analyze(
+    req: AnalyzeRequest,
+    db: Session = Depends(get_db),
+    client: IntegrationClient = Depends(require_scope("analysis:create")),
+):
+    if not settings.CLARAMED_INTEGRATION_ENABLED:
+        raise HTTPException(status_code=503, detail="Integration is disabled")
+    try:
+        analysis, _created = svc.submit_analysis(db, client, req)
+    except FetchError as exc:
+        return JSONResponse(status_code=422, content={"error": {"code": exc.code, "message": exc.message}})
+    return AnalyzeResponse(jobId=str(analysis.id), status=svc.status_label(analysis))
+
+
+@router.get("/status/{job_id}")
+def job_status(
+    job_id: str,
+    db: Session = Depends(get_db),
+    client: IntegrationClient = Depends(require_scope("analysis:read")),
+):
+    try:
+        job_uuid = uuid.UUID(job_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Job not found")
+    analysis = db.query(MedicalAnalysis).filter_by(id=job_uuid, requesting_client_id=client.id).first()
+    if not analysis:
+        raise HTTPException(status_code=404, detail="Job not found")
+    id_field = "radiologyId" if analysis.external_record_kind == "radiology" else "documentId"
+    return {
+        "jobId": str(analysis.id),
+        "status": svc.status_label(analysis),
+        id_field: analysis.external_record_id,
+        "results": svc.build_results_payload(db, analysis),
+        "deliveryStatus": analysis.delivery_status,
+    }</code></pre>
+<pre><code># backend/main.py
+from backend.api.routes import health, analyses, integration
+...
+app.include_router(integration.router, prefix="/api/v1", tags=["Integration"])</code></pre>
+
+<p class="step">- [ ] Step 6: Run to verify it passes</p>
+<p>Run: <code>python -m pytest tests/api -v</code><br>Expected: all pass. If <code>test_radiology_submit…</code> fails on <code>storage_dir / storage_key</code>, confirm <code>StorageService._save_file_local</code> writes under <code>settings.STORAGE_LOCAL_PATH</code> (set by conftest before import).</p>
+
+<p class="step">- [ ] Step 7: Commit</p>
+<pre><code>git add backend tests
+git commit -m "feat: authenticated /analyze and /status endpoints with idempotency and audit"</code></pre>
+</div>
+
+<!-- ============================ T7 ============================ -->
+<div class="task">
+<h3>Task 7: Finalize on completion or failure (delete file, set retention, queue callback)</h3>
+<p class="meta"><strong>Requirements:</strong> R9, R12</p>
+<p><strong>Files:</strong></p>
+<ul>
+<li>Create: <code>backend/services/finalizer.py</code></li>
+<li>Modify: <code>backend/workers/tasks.py:23-47</code> (<code>AnalysisTask</code> hooks)</li>
+<li>Test: <code>tests/unit/test_finalizer.py</code></li>
+</ul>
+<p><strong>Relies on:</strong></p>
+<ul>
+<li>EXISTS: backend/workers/tasks.py AnalysisTask</li>
+<li>EXISTS: backend/services/storage_service.py StorageService.delete_file</li>
+<li>EXISTS: backend/database/connection.py get_db_context</li>
+</ul>
+<p><strong>Interfaces:</strong><br>
+Consumes <code>record_event</code> (T6), columns (T1).<br>
+Produces <code>finalize_integration_analysis(db, analysis_id: str, enqueue=None) -&gt; bool</code>: returns <code>False</code> without side effects if the analysis is not an integration analysis (no <code>external_record_id</code>) or was already finalized (<code>results_expire_at</code> set); otherwise deletes every stored file for the analysis, sets <code>results_expire_at = now + RESULT_RETENTION_DAYS</code>, records <code>file_deleted</code> audit events, calls <code>enqueue(analysis_id)</code> (default: <code>deliver_callback.delay</code>, imported lazily from <code>backend.workers.callbacks</code>), returns <code>True</code>.<br>
+<code>AnalysisTask.on_success</code> and <code>on_failure</code> call it with <code>args[0]</code>.</p>
+
+<p class="step">- [ ] Step 1: Write the failing test</p>
+<pre><code># tests/unit/test_finalizer.py
+import uuid
+from datetime import datetime, timedelta
+from unittest.mock import MagicMock
+
+from backend.core.config import settings
+from backend.models.analysis import AnalysisStatus, AnalysisType, MedicalAnalysis
+from backend.models.audit import AuditEvent
+from backend.models.document import DocumentType, UploadedDocument
+from backend.services.finalizer import finalize_integration_analysis
+from backend.services.storage_service import StorageService
+from backend.workers.tasks import AnalysisTask
+
+
+def _analysis_with_file(db, client, storage_dir, record_id="rad-1", integration=True):
+    a = MedicalAnalysis(
+        analysis_type=AnalysisType.XRAY, status=AnalysisStatus.COMPLETED,
+        requesting_client_id=client.id,
+        external_record_kind="radiology" if integration else None,
+        external_record_id=record_id if integration else None,
+    )
+    db.add(a)
+    db.flush()
+    key = f"images/{a.id}/x.png"
+    path = storage_dir / key
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"\x89PNG")
+    db.add(UploadedDocument(analysis_id=a.id, filename="x.png", original_filename="x.png",
+                            file_type=DocumentType.IMAGE_PNG, file_size=4, checksum="c",
+                            storage_key=key, storage_provider="local"))
+    db.commit()
+    return a, path
+
+
+def test_deletes_file_sets_expiry_and_enqueues(db, make_client, storage_dir):
+    reg = make_client()
+    a, path = _analysis_with_file(db, reg.client, storage_dir)
+    enqueue = MagicMock()
+    assert finalize_integration_analysis(db, str(a.id), enqueue=enqueue) is True
+    assert not path.exists()
+    db.refresh(a)
+    expected = datetime.utcnow() + timedelta(days=settings.RESULT_RETENTION_DAYS)
+    assert abs((a.results_expire_at - expected).total_seconds()) &lt; 60
+    enqueue.assert_called_once_with(str(a.id))
+    assert db.query(AuditEvent).filter_by(action="file_deleted", resource_id=str(a.id)).count() == 1
+
+
+def test_second_call_is_a_noop(db, make_client, storage_dir):
+    reg = make_client()
+    a, _ = _analysis_with_file(db, reg.client, storage_dir)
+    enqueue = MagicMock()
+    finalize_integration_analysis(db, str(a.id), enqueue=enqueue)
+    assert finalize_integration_analysis(db, str(a.id), enqueue=enqueue) is False
+    assert enqueue.call_count == 1
+
+
+def test_legacy_analysis_is_untouched(db, make_client, storage_dir):
+    reg = make_client()
+    a, path = _analysis_with_file(db, reg.client, storage_dir, integration=False)
+    enqueue = MagicMock()
+    assert finalize_integration_analysis(db, str(a.id), enqueue=enqueue) is False
+    assert path.exists() and not enqueue.called
+
+
+def test_missing_file_does_not_block_callback(db, make_client, storage_dir):
+    reg = make_client()
+    a, path = _analysis_with_file(db, reg.client, storage_dir)
+    path.unlink()
+    enqueue = MagicMock()
+    assert finalize_integration_analysis(db, str(a.id), enqueue=enqueue) is True
+    enqueue.assert_called_once()
+
+
+def test_task_hooks_call_finalizer(monkeypatch):
+    calls = []
+    monkeypatch.setattr("backend.workers.tasks.finalize_after_task", lambda aid: calls.append(aid))
+    task = AnalysisTask()
+    task.on_success(None, "tid", (str(uuid.uuid4()), "doc"), {})
+    task.on_failure(RuntimeError("x"), "tid", (str(uuid.uuid4()),), {}, None)
+    assert len(calls) == 2</code></pre>
+
+<p class="step">- [ ] Step 2: Run to verify it fails</p>
+<p>Run: <code>python -m pytest tests/unit/test_finalizer.py -v</code><br>Expected: FAIL with <code>ModuleNotFoundError: backend.services.finalizer</code>.</p>
+
+<p class="step">- [ ] Step 3: Implement the finalizer</p>
+<pre><code># backend/services/finalizer.py
+"""After an integration analysis ends: delete source files, set retention, queue the callback."""
+from datetime import datetime, timedelta
+from uuid import UUID
+
+from sqlalchemy.orm import Session
+
+from backend.core.config import settings
+from backend.core.logging import get_logger
+from backend.models.analysis import MedicalAnalysis
+from backend.models.document import UploadedDocument
+from backend.services.audit_service import record_event
+from backend.services.storage_service import StorageService
+
+logger = get_logger(__name__)
+
+
+def _default_enqueue(analysis_id: str) -&gt; None:
+    from backend.workers.callbacks import deliver_callback  # lazy: avoids an import cycle with tasks
+    deliver_callback.delay(analysis_id)
+
+
+def finalize_integration_analysis(db: Session, analysis_id: str, enqueue=None) -&gt; bool:
+    analysis = db.query(MedicalAnalysis).filter(MedicalAnalysis.id == UUID(analysis_id)).first()
+    if not analysis or analysis.external_record_id is None or analysis.results_expire_at is not None:
+        return False
+
+    storage = StorageService()
+    for doc in db.query(UploadedDocument).filter_by(analysis_id=analysis.id).all():
+        try:
+            storage.delete_file(doc.storage_key)
+        except Exception as exc:  # a missing file must not block delivery
+            logger.warning("source file delete failed", analysis_id=analysis_id, error=type(exc).__name__)
+        record_event(db, action="file_deleted", resource_type="analysis", resource_id=analysis_id,
+                     outcome="success", client_id=analysis.requesting_client_id)
+
+    analysis.results_expire_at = datetime.utcnow() + timedelta(days=settings.RESULT_RETENTION_DAYS)
+    analysis.delivery_status = "pending"
+    db.commit()
+    (enqueue or _default_enqueue)(analysis_id)
+    return True
+</code></pre>
+<p>Check <code>StorageService.delete_file</code> (storage_service.py:235): if it returns <code>False</code> for a missing key instead of raising, the test still passes; if it raises, the <code>except</code> above handles it.</p>
+
+<p class="step">- [ ] Step 4: Wire the hooks in <code>tasks.py</code></p>
+<pre><code># backend/workers/tasks.py
+from backend.services.finalizer import finalize_integration_analysis
+
+
+def finalize_after_task(analysis_id: str) -&gt; None:
+    """Run integration finalization; never let it break the task machinery."""
+    try:
+        with get_db_context() as db:
+            finalize_integration_analysis(db, analysis_id)
+    except Exception as exc:
+        logger.error(f"Finalization failed: {exc}", analysis_id=analysis_id)
+
+
+class AnalysisTask(Task):
+    def on_success(self, retval, task_id, args, kwargs):
+        if args:
+            finalize_after_task(args[0])
+
+    def on_failure(self, exc, task_id, args, kwargs, einfo):
+        ...existing body unchanged...
+        if args:
+            finalize_after_task(args[0])</code></pre>
+<p>Append the <code>finalize_after_task(args[0])</code> call as the last statement of the existing <code>on_failure</code> body (after the status update, outside its <code>try</code>).</p>
+
+<p class="step">- [ ] Step 5: Run to verify it passes</p>
+<p>Run: <code>python -m pytest tests/unit/test_finalizer.py tests/api -v</code><br>Expected: all pass.</p>
+
+<p class="step">- [ ] Step 6: Commit</p>
+<pre><code>git add backend tests
+git commit -m "feat: delete source files and schedule callback when an integration analysis ends"</code></pre>
+</div>
+
+<!-- ============================ T8 ============================ -->
+<div class="task">
+<h3>Task 8: Signed callback delivery with retries</h3>
+<p class="meta"><strong>Requirements:</strong> R7, R8, R12</p>
+<p><strong>Files:</strong></p>
+<ul>
+<li>Create: <code>backend/workers/callbacks.py</code></li>
+<li>Modify: <code>backend/workers/celery_app.py</code> (autodiscover callbacks and retention modules)</li>
+<li>Create: <code>tests/support/__init__.py</code>, <code>tests/support/jeevacare_stub.py</code></li>
+<li>Test: <code>tests/unit/test_callbacks.py</code></li>
+</ul>
+<p><strong>Relies on:</strong></p>
+<ul>
+<li>EXISTS: backend/core/signing.py sign_payload</li>
+<li>EXISTS: backend/services/integration_service.py build_results_payload</li>
+<li>EXISTS: backend/services/audit_service.py record_event</li>
+<li>EXISTS: backend/workers/celery_app.py celery_app</li>
+</ul>
+<p><strong>Interfaces:</strong><br>
+Produces <code>run_delivery_attempt(db, analysis_id: str, attempt_index: int, http: httpx.Client) -&gt; str</code> returning <code>"delivered"</code>, <code>"retry"</code> or <code>"failed"</code> (increments <code>delivery_attempts</code>, writes <code>delivery_last_error</code>, audit event per attempt; <code>"failed"</code> when this was attempt number <code>CALLBACK_MAX_ATTEMPTS</code>);<br>
+<code>build_callback_body(db, analysis) -&gt; bytes</code> (canonical JSON: sorted keys, no spaces);<br>
+<code>backoff_seconds(retries_so_far: int) -&gt; int</code> = <code>CALLBACK_BACKOFF_BASE_SECONDS * 2**retries_so_far</code>;<br>
+Celery task <code>deliver_callback(self, analysis_id: str)</code> (name <code>backend.workers.callbacks.deliver_callback</code>);<br>
+Test helper <code>JeevaCareStub(secret: str)</code> with <code>.transport()</code> (an <code>httpx.MockTransport</code>), <code>.received: list[dict]</code>, <code>.fail_next: int</code> (that many requests answer 500 first), <code>.reject_signatures: bool</code>.<br>
+Callback JSON: <code>{"jobId", "status": "completed"|"failed", "radiologyId"|"documentId", "results": {...}|null, "error": {"code": "analysis_failed"}|null}</code>. Headers: <code>X-ClaraMed-Timestamp</code>, <code>X-ClaraMed-Signature</code>, <code>Content-Type: application/json</code>. Redirects are not followed.</p>
+
+<p class="step">- [ ] Step 1: Write the stub and the failing test</p>
+<pre><code># tests/support/jeevacare_stub.py
+"""Test double for JeevaCare's callback route. Verifies the ClaraMed signature."""
+import json
+
+import httpx
+
+from backend.core.signing import verify_signature
+
+
+class JeevaCareStub:
+    def __init__(self, secret: str):
+        self.secret = secret
+        self.received: list[dict] = []
+        self.fail_next = 0
+        self.reject_signatures = False
+        self.requests = 0
+
+    def _handle(self, request: httpx.Request) -&gt; httpx.Response:
+        self.requests += 1
+        if self.fail_next &gt; 0:
+            self.fail_next -= 1
+            return httpx.Response(500, json={"success": False})
+        ts = request.headers.get("X-ClaraMed-Timestamp", "0")
+        sig = request.headers.get("X-ClaraMed-Signature", "")
+        valid = verify_signature(self.secret, int(ts), request.content, sig)
+        if self.reject_signatures or not valid:
+            return httpx.Response(401, json={"success": False, "reason": "bad signature"})
+        self.received.append(json.loads(request.content))
+        return httpx.Response(200, json={"success": True})
+
+    def transport(self) -&gt; httpx.MockTransport:
+        return httpx.MockTransport(self._handle)
+
+    def client(self) -&gt; httpx.Client:
+        return httpx.Client(transport=self.transport(), follow_redirects=False)</code></pre>
+<pre><code># tests/unit/test_callbacks.py
+import json
+import uuid
+
+import httpx
+import pytest
+
+from backend.core.config import settings
+from backend.models.analysis import AnalysisStatus, AnalysisType, MedicalAnalysis
+from backend.models.audit import AuditEvent
+from backend.models.result import AnalysisResult, ResultType
+from backend.workers.callbacks import backoff_seconds, build_callback_body, run_delivery_attempt
+from tests.support.jeevacare_stub import JeevaCareStub
+
+
+@pytest.fixture
+def setup(db, make_client):
+    reg = make_client()
+    a = MedicalAnalysis(
+        analysis_type=AnalysisType.XRAY, status=AnalysisStatus.COMPLETED,
+        requesting_client_id=reg.client.id, external_record_kind="radiology",
+        external_record_id="rad-1", delivery_status="pending",
+    )
+    db.add(a)
+    db.flush()
+    db.add(AnalysisResult(analysis_id=a.id, result_type=ResultType.RADIOLOGY_INFERENCE, content={
+        "findings": [{"label": "Edema", "model_score": 0.9}], "disclaimer": "d"}))
+    db.commit()
+    return a, JeevaCareStub(reg.webhook_secret)
+
+
+def test_body_is_canonical_and_complete(db, setup):
+    a, _ = setup
+    body = json.loads(build_callback_body(db, a))
+    assert body["jobId"] == str(a.id) and body["status"] == "completed"
+    assert body["radiologyId"] == "rad-1" and body["error"] is None
+    assert body["results"]["findings"][0]["label"] == "Edema"
+    raw = build_callback_body(db, a)
+    assert b" " not in raw.split(b'"summary"')[0]  # compact separators
+
+
+def test_failed_analysis_sends_generic_error(db, setup):
+    a, _ = setup
+    a.status = AnalysisStatus.FAILED
+    a.error_message = "Traceback: secret internals"
+    db.commit()
+    body = json.loads(build_callback_body(db, a))
+    assert body["status"] == "failed" and body["results"] is None
+    assert body["error"] == {"code": "analysis_failed"}
+    assert "Traceback" not in json.dumps(body)
+
+
+def test_delivers_with_valid_signature(db, setup):
+    a, stub = setup
+    assert run_delivery_attempt(db, str(a.id), 0, stub.client()) == "delivered"
+    db.refresh(a)
+    assert a.delivery_status == "delivered" and a.delivery_attempts == 1
+    assert a.callback_delivered_at is not None
+    assert stub.received[0]["jobId"] == str(a.id)
+
+
+def test_server_error_requests_retry(db, setup):
+    a, stub = setup
+    stub.fail_next = 1
+    assert run_delivery_attempt(db, str(a.id), 0, stub.client()) == "retry"
+    db.refresh(a)
+    assert a.delivery_status == "pending" and a.delivery_attempts == 1
+    assert "500" in a.delivery_last_error
+
+
+def test_wrong_secret_is_rejected_and_retried(db, setup):
+    a, _ = setup
+    bad = JeevaCareStub("not-the-secret")
+    assert run_delivery_attempt(db, str(a.id), 0, bad.client()) == "retry"
+    assert bad.received == []
+
+
+def test_connection_error_requests_retry(db, setup):
+    a, _ = setup
+    def boom(request):
+        raise httpx.ConnectError("down")
+    client = httpx.Client(transport=httpx.MockTransport(boom))
+    assert run_delivery_attempt(db, str(a.id), 0, client) == "retry"
+
+
+def test_redirect_is_not_followed(db, setup):
+    a, _ = setup
+    def redirect(request):
+        return httpx.Response(302, headers={"location": "https://evil.example/x"})
+    client = httpx.Client(transport=httpx.MockTransport(redirect), follow_redirects=False)
+    assert run_delivery_attempt(db, str(a.id), 0, client) == "retry"
+
+
+def test_exhaustion_marks_failed_after_max_attempts(db, setup):
+    a, stub = setup
+    stub.fail_next = 99
+    outcomes = [run_delivery_attempt(db, str(a.id), i, stub.client()) for i in range(settings.CALLBACK_MAX_ATTEMPTS)]
+    assert outcomes[:-1] == ["retry"] * (settings.CALLBACK_MAX_ATTEMPTS - 1)
+    assert outcomes[-1] == "failed"
+    db.refresh(a)
+    assert a.delivery_status == "failed" and a.delivery_attempts == settings.CALLBACK_MAX_ATTEMPTS
+
+
+def test_retry_then_success(db, setup):
+    a, stub = setup
+    stub.fail_next = 2
+    outcomes = [run_delivery_attempt(db, str(a.id), i, stub.client()) for i in range(3)]
+    assert outcomes == ["retry", "retry", "delivered"]
+
+
+def test_already_delivered_is_not_resent(db, setup):
+    a, stub = setup
+    run_delivery_attempt(db, str(a.id), 0, stub.client())
+    assert run_delivery_attempt(db, str(a.id), 1, stub.client()) == "delivered"
+    assert len(stub.received) == 1
+
+
+def test_each_attempt_is_audited_without_patient_refs(db, setup):
+    a, stub = setup
+    a.external_patient_reference = "JV-PAT-SECRET"
+    db.commit()
+    stub.fail_next = 1
+    run_delivery_attempt(db, str(a.id), 0, stub.client())
+    run_delivery_attempt(db, str(a.id), 1, stub.client())
+    events = db.query(AuditEvent).filter_by(action="callback_attempt").all()
+    assert sorted(e.outcome for e in events) == ["failure", "success"]
+    assert "JV-PAT-SECRET" not in json.dumps([e.event_metadata for e in events])
+
+
+def test_backoff_totals_about_thirty_minutes():
+    assert [backoff_seconds(n) for n in range(4)] == [120, 240, 480, 960]
+    assert sum(backoff_seconds(n) for n in range(4)) == 1800</code></pre>
+
+<p class="step">- [ ] Step 2: Run to verify it fails</p>
+<p>Run: <code>python -m pytest tests/unit/test_callbacks.py -v</code><br>Expected: FAIL with <code>ModuleNotFoundError: backend.workers.callbacks</code>.</p>
+
+<p class="step">- [ ] Step 3: Implement</p>
+<pre><code># backend/workers/callbacks.py
+"""Deliver signed result callbacks to a client's registered webhook."""
+import json
+import time
+from datetime import datetime
+from uuid import UUID
+
+import httpx
+from sqlalchemy.orm import Session
+
+from backend.core.config import settings
+from backend.core.logging import get_logger
+from backend.core.signing import sign_payload
+from backend.database.connection import get_db_context
+from backend.models.analysis import AnalysisStatus, MedicalAnalysis
+from backend.models.integration_client import IntegrationClient
+from backend.services.audit_service import record_event
+from backend.services.integration_service import build_results_payload
+from backend.workers.celery_app import celery_app
+
+logger = get_logger(__name__)
+
+
+def backoff_seconds(retries_so_far: int) -&gt; int:
+    return settings.CALLBACK_BACKOFF_BASE_SECONDS * (2 ** retries_so_far)
+
+
+def build_callback_body(db: Session, analysis: MedicalAnalysis) -&gt; bytes:
+    failed = analysis.status == AnalysisStatus.FAILED
+    id_field = "radiologyId" if analysis.external_record_kind == "radiology" else "documentId"
+    payload = {
+        "jobId": str(analysis.id),
+        "status": "failed" if failed else "completed",
+        id_field: analysis.external_record_id,
+        "results": None if failed else build_results_payload(db, analysis),
+        "error": {"code": "analysis_failed"} if failed else None,
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+
+
+def _http_client() -&gt; httpx.Client:
+    return httpx.Client(timeout=settings.CALLBACK_TIMEOUT_SECONDS, follow_redirects=False)
+
+
+def run_delivery_attempt(db: Session, analysis_id: str, attempt_index: int, http: httpx.Client) -&gt; str:
+    analysis = db.query(MedicalAnalysis).filter(MedicalAnalysis.id == UUID(analysis_id)).first()
+    if analysis is None:
+        return "failed"
+    if analysis.delivery_status == "delivered":
+        return "delivered"
+    client = db.query(IntegrationClient).filter(IntegrationClient.id == analysis.requesting_client_id).first()
+
+    body = build_callback_body(db, analysis)
+    timestamp = int(time.time())
+    headers = {
+        "Content-Type": "application/json",
+        "X-ClaraMed-Timestamp": str(timestamp),
+        "X-ClaraMed-Signature": sign_payload(client.webhook_secret, timestamp, body),
+    }
+    error = None
+    try:
+        response = http.post(client.webhook_url, content=body, headers=headers)
+        if not 200 &lt;= response.status_code &lt; 300:
+            error = f"http {response.status_code}"
+    except httpx.HTTPError as exc:
+        error = type(exc).__name__
+
+    analysis.delivery_attempts = (analysis.delivery_attempts or 0) + 1
+    if error is None:
+        analysis.delivery_status = "delivered"
+        analysis.delivery_last_error = None
+        analysis.callback_delivered_at = datetime.utcnow()
+        outcome = "delivered"
+    else:
+        analysis.delivery_last_error = error
+        outcome = "failed" if attempt_index + 1 &gt;= settings.CALLBACK_MAX_ATTEMPTS else "retry"
+        if outcome == "failed":
+            analysis.delivery_status = "failed"
+    db.commit()
+    record_event(db, action="callback_attempt", resource_type="analysis", resource_id=analysis_id,
+                 outcome="success" if error is None else "failure", client_id=client.id,
+                 client_name=client.client_name, error=error,
+                 metadata={"attempt": attempt_index + 1})
+    return outcome
+
+
+@celery_app.task(bind=True, max_retries=settings.CALLBACK_MAX_ATTEMPTS - 1)
+def deliver_callback(self, analysis_id: str):
+    with get_db_context() as db, _http_client() as http:
+        outcome = run_delivery_attempt(db, analysis_id, self.request.retries, http)
+    if outcome == "retry":
+        raise self.retry(countdown=backoff_seconds(self.request.retries))
+    return outcome</code></pre>
+<pre><code># backend/workers/celery_app.py  (replace the autodiscover line)
+celery_app.autodiscover_tasks(["backend.workers"])
+celery_app.autodiscover_tasks(["backend.workers"], related_name="callbacks")
+celery_app.autodiscover_tasks(["backend.workers"], related_name="retention")</code></pre>
+
+<p class="step">- [ ] Step 4: Run to verify it passes</p>
+<p>Run: <code>python -m pytest tests/unit/test_callbacks.py -v</code><br>Expected: 12 passed. Then verify the task registers: <code>python -c "from backend.workers.celery_app import celery_app; import backend.workers.callbacks; print('backend.workers.callbacks.deliver_callback' in celery_app.tasks)"</code> → <code>True</code>.</p>
+
+<p class="step">- [ ] Step 5: Commit</p>
+<pre><code>git add backend tests
+git commit -m "feat: HMAC-signed callback delivery with exponential-backoff retries"</code></pre>
+</div>
+
+<!-- ============================ T9 ============================ -->
+<div class="task">
+<h3>Task 9: Retention purge</h3>
+<p class="meta"><strong>Requirements:</strong> R9, R12</p>
+<p><strong>Files:</strong></p>
+<ul>
+<li>Create: <code>backend/workers/retention.py</code></li>
+<li>Modify: <code>backend/workers/celery_app.py</code> (beat schedule)</li>
+<li>Test: <code>tests/unit/test_retention.py</code></li>
+</ul>
+<p><strong>Relies on:</strong></p>
+<ul>
+<li>EXISTS: backend/models/analysis.py MedicalAnalysis</li>
+<li>EXISTS: backend/services/storage_service.py StorageService</li>
+</ul>
+<p><strong>Interfaces:</strong><br>
+Produces <code>purge_expired(db, now: datetime | None = None) -&gt; int</code> (deletes analyses whose <code>results_expire_at</code> is past, with cascade to results/documents/findings, removes any stored file still present, writes one <code>results_purged</code> audit event per run with the count only, returns the count) and Celery task <code>backend.workers.retention.purge_expired_results</code>.</p>
+
+<p class="step">- [ ] Step 1: Write the failing test</p>
+<pre><code># tests/unit/test_retention.py
+from datetime import datetime, timedelta
+
+from backend.models.analysis import AnalysisType, MedicalAnalysis
+from backend.models.audit import AuditEvent
+from backend.models.result import AnalysisResult, ResultType
+from backend.workers.retention import purge_expired
+
+
+def _a(db, client, record, expires):
+    a = MedicalAnalysis(analysis_type=AnalysisType.XRAY, requesting_client_id=client.id,
+                        external_record_kind="radiology", external_record_id=record,
+                        results_expire_at=expires)
+    db.add(a)
+    db.flush()
+    db.add(AnalysisResult(analysis_id=a.id, result_type=ResultType.RADIOLOGY_INFERENCE, content={}))
+    db.commit()
+    return a
+
+
+def test_purges_only_expired(db, make_client):
+    reg = make_client()
+    now = datetime.utcnow()
+    old = _a(db, reg.client, "old", now - timedelta(days=1))
+    fresh = _a(db, reg.client, "fresh", now + timedelta(days=5))
+    no_expiry = _a(db, reg.client, "none", None)
+    assert purge_expired(db, now) == 1
+    ids = {a.id for a in db.query(MedicalAnalysis).all()}
+    assert old.id not in ids and fresh.id in ids and no_expiry.id in ids
+    assert db.query(AnalysisResult).count() == 2   # cascade removed the old result
+
+
+def test_audit_event_has_count_only(db, make_client):
+    reg = make_client()
+    _a(db, reg.client, "old", datetime.utcnow() - timedelta(days=1))
+    purge_expired(db)
+    event = db.query(AuditEvent).filter_by(action="results_purged").one()
+    assert event.event_metadata == {"count": 1}
+
+
+def test_nothing_to_purge_writes_no_event(db, make_client):
+    assert purge_expired(db) == 0
+    assert db.query(AuditEvent).filter_by(action="results_purged").count() == 0</code></pre>
+
+<p class="step">- [ ] Step 2: Run to verify it fails</p>
+<p>Run: <code>python -m pytest tests/unit/test_retention.py -v</code><br>Expected: FAIL with <code>ModuleNotFoundError: backend.workers.retention</code>.</p>
+
+<p class="step">- [ ] Step 3: Implement</p>
+<pre><code># backend/workers/retention.py
+"""Purge integration results past their retention window."""
+from datetime import datetime
+
+from sqlalchemy.orm import Session
+
+from backend.core.logging import get_logger
+from backend.database.connection import get_db_context
+from backend.models.analysis import MedicalAnalysis
+from backend.models.document import UploadedDocument
+from backend.services.audit_service import record_event
+from backend.services.storage_service import StorageService
+from backend.workers.celery_app import celery_app
+
+logger = get_logger(__name__)
+
+
+def purge_expired(db: Session, now: datetime | None = None) -&gt; int:
+    now = now or datetime.utcnow()
+    expired = db.query(MedicalAnalysis).filter(
+        MedicalAnalysis.results_expire_at.isnot(None),
+        MedicalAnalysis.results_expire_at &lt; now,
+    ).all()
+    if not expired:
+        return 0
+    storage = StorageService()
+    for analysis in expired:
+        for doc in db.query(UploadedDocument).filter_by(analysis_id=analysis.id).all():
+            try:
+                storage.delete_file(doc.storage_key)  # normally already gone; belt and braces
+            except Exception:
+                pass
+        db.delete(analysis)  # cascades to results, documents, findings
+    db.commit()
+    record_event(db, action="results_purged", resource_type="analysis", resource_id=None,
+                 outcome="success", metadata={"count": len(expired)})
+    logger.info("purged expired results", count=len(expired))
+    return len(expired)
+
+
+@celery_app.task
+def purge_expired_results() -&gt; int:
+    with get_db_context() as db:
+        return purge_expired(db)</code></pre>
+<pre><code># backend/workers/celery_app.py  (before the autodiscover lines)
+celery_app.conf.beat_schedule = {
+    "purge-expired-results": {
+        "task": "backend.workers.retention.purge_expired_results",
+        "schedule": 3600.0,
+    },
+}</code></pre>
+
+<p class="step">- [ ] Step 4: Run to verify it passes</p>
+<p>Run: <code>python -m pytest tests/unit/test_retention.py -v</code><br>Expected: 3 passed.</p>
+
+<p class="step">- [ ] Step 5: Commit</p>
+<pre><code>git add backend tests
+git commit -m "feat: hourly purge of results past retention"</code></pre>
+</div>
+
+<!-- ============================ T10 ============================ -->
+<div class="task">
+<h3>Task 10: End-to-end tests against the JeevaCare stub</h3>
+<p class="meta"><strong>Requirements:</strong> R14 (and exercises R1-R9)</p>
+<p><strong>Files:</strong></p>
+<ul>
+<li>Test: <code>tests/integration/test_jeevacare_e2e.py</code></li>
+<li>Test: <code>tests/integration/test_real_inference.py</code> (marked <code>slow</code>)</li>
+</ul>
+<p><strong>Relies on:</strong></p>
+<ul>
+<li>EXISTS: backend/workers/tasks.py process_radiology_async</li>
+<li>EXISTS: backend/workers/tasks.py process_document_async</li>
+<li>EXISTS: backend/services/radiology_service.py RadiologyService</li>
+<li>EXISTS: backend/services/document_service.py DocumentService</li>
+</ul>
+<p><strong>Interfaces:</strong> Consumes everything from Tasks 0-9. Produces no new interface. The flow runs with Celery in eager mode (conftest): <code>POST /analyze</code> → worker → finalizer → <code>deliver_callback</code> → stub. The stub's client is injected by patching <code>backend.workers.callbacks._http_client</code>. File downloads are served by patching <code>integration_service.fetch_file</code> with real bytes (the fetcher itself is covered in Task 5).</p>
+
+<p class="step">- [ ] Step 1: Write the tests</p>
+<pre><code># tests/integration/test_jeevacare_e2e.py
+import io
+import uuid
+
+import pytest
+from PIL import Image
+
+from backend.models.analysis import AnalysisStatus, MedicalAnalysis
+from backend.models.audit import AuditEvent
+from backend.services import integration_service
+from backend.services.document_service import DocumentService
+from backend.services.radiology_service import RadiologyService
+from backend.services.url_fetcher import FetchedFile, FetchError
+from backend.workers import callbacks
+from tests.support.jeevacare_stub import JeevaCareStub
+
+FAKE_RESULT = {
+    "modality": "chest_xray", "model_name": "densenet121-res224-all", "disclaimer": "Not a diagnosis.",
+    "processing_duration_seconds": 0.1,
+    "findings": [{"label": "Edema", "model_score": 0.83}, {"label": "Atelectasis", "model_score": 0.12}],
+}
+
+
+def _png_bytes():
+    buf = io.BytesIO()
+    Image.new("L", (224, 224), 128).save(buf, "PNG")
+    return buf.getvalue()
+
+
+@pytest.fixture
+def world(monkeypatch, make_client, auth_headers, api_client, db):
+    reg = make_client()
+    stub = JeevaCareStub(reg.webhook_secret)
+    monkeypatch.setattr(callbacks, "_http_client", stub.client)
+    monkeypatch.setattr(RadiologyService, "analyze_chest_xray", lambda self, path: FAKE_RESULT)
+    monkeypatch.setattr(DocumentService, "extract_text_from_pdf",
+                        lambda self, path: {"text": "Hemoglobin 9.1 g/dL", "requires_ocr": False})
+    monkeypatch.setattr(DocumentService, "explain_report",
+                        lambda self, report_text, language: {"explanation": "Your hemoglobin is low.", "model": "stub"})
+    monkeypatch.setattr(DocumentService, "extract_structured_findings",
+                        lambda self, report_text, language: [{"test": "Hemoglobin", "value": 9.1}])
+    monkeypatch.setattr(integration_service, "fetch_file", lambda url, **kw: FetchedFile(
+        content=_png_bytes() if kw["kind"] == "radiology" else b"%PDF-1.4\n" + b"0" * 32,
+        kind_detected="png" if kw["kind"] == "radiology" else "pdf",
+        extension=".png" if kw["kind"] == "radiology" else ".pdf"))
+    return reg, stub, auth_headers(reg.api_key)
+
+
+def _stored_files(storage_dir):
+    return [p for p in storage_dir.rglob("*") if p.is_file()]
+
+
+def test_radiology_end_to_end(world, api_client, db, storage_dir):
+    reg, stub, headers = world
+    r = api_client.post("/api/v1/analyze", headers=headers, json={
+        "type": "radiology", "radiologyId": "rad-1", "fileUrl": "https://res.cloudinary.com/x/a.png",
+        "patientRef": "JV-PAT-1", "hospitalRef": "JV-HOSP-1"})
+    assert r.status_code == 202
+    job = r.json()["jobId"]
+
+    # worker ran eagerly: callback delivered, source file gone, retention set
+    assert len(stub.received) == 1
+    cb = stub.received[0]
+    assert cb["jobId"] == job and cb["status"] == "completed" and cb["radiologyId"] == "rad-1"
+    assert cb["results"]["findings"][0] == {"label": "Edema", "score": 0.83}
+    assert _stored_files(storage_dir) == []
+    analysis = db.get(MedicalAnalysis, uuid.UUID(job))
+    db.refresh(analysis)
+    assert analysis.status == AnalysisStatus.COMPLETED
+    assert analysis.delivery_status == "delivered" and analysis.results_expire_at is not None
+
+    # polling still works and matches the callback
+    status = api_client.get(f"/api/v1/status/{job}", headers=headers).json()
+    assert status["status"] == "completed" and status["deliveryStatus"] == "delivered"
+    assert status["results"] == cb["results"]
+    actions = {e.action for e in db.query(AuditEvent).all()}
+    assert {"analysis_submitted", "file_deleted", "callback_attempt"} &lt;= actions
+
+
+def test_document_end_to_end(world, api_client, db, storage_dir):
+    _, stub, headers = world
+    r = api_client.post("/api/v1/analyze", headers=headers, json={
+        "type": "document", "documentId": "doc-7", "fileUrl": "https://res.cloudinary.com/x/r.pdf"})
+    assert r.status_code == 202
+    cb = stub.received[0]
+    assert cb["documentId"] == "doc-7" and cb["status"] == "completed"
+    assert cb["results"]["explanation"] == "Your hemoglobin is low."
+    assert _stored_files(storage_dir) == []
+
+
+def test_worker_failure_sends_failed_callback_and_deletes_file(world, monkeypatch, api_client, storage_dir):
+    _, stub, headers = world
+    def boom(self, path):
+        raise RuntimeError("model exploded: internal detail")
+    monkeypatch.setattr(RadiologyService, "analyze_chest_xray", boom)
+    api_client.post("/api/v1/analyze", headers=headers, json={
+        "type": "radiology", "radiologyId": "rad-2", "fileUrl": "https://res.cloudinary.com/x/a.png"})
+    assert stub.received and stub.received[-1]["status"] == "failed"
+    assert "internal detail" not in str(stub.received[-1])
+    assert _stored_files(storage_dir) == []
+
+
+def test_receiver_outage_then_recovery(world, db):
+    reg, stub, _ = world
+    a = MedicalAnalysis(analysis_type=integration_service.AnalysisType.XRAY, status=AnalysisStatus.COMPLETED,
+                        requesting_client_id=reg.client.id, external_record_kind="radiology",
+                        external_record_id="rad-3", delivery_status="pending")
+    db.add(a); db.commit()
+    stub.fail_next = 2
+    outcomes = [callbacks.run_delivery_attempt(db, str(a.id), i, stub.client()) for i in range(3)]
+    assert outcomes == ["retry", "retry", "delivered"]
+
+
+def test_tampered_signature_is_detected_by_receiver(world, db):
+    reg, _, _ = world
+    stub = JeevaCareStub("a-different-secret")
+    a = MedicalAnalysis(analysis_type=integration_service.AnalysisType.XRAY, status=AnalysisStatus.COMPLETED,
+                        requesting_client_id=reg.client.id, external_record_kind="radiology",
+                        external_record_id="rad-4", delivery_status="pending")
+    db.add(a); db.commit()
+    assert callbacks.run_delivery_attempt(db, str(a.id), 0, stub.client()) == "retry"
+    assert stub.received == []
+
+
+@pytest.mark.parametrize("code", ["host_not_allowed", "blocked_address", "too_large"])
+def test_intake_rejections_surface_as_422_and_store_nothing(world, monkeypatch, api_client, db, storage_dir, code):
+    _, stub, headers = world
+    def reject(url, **kw):
+        raise FetchError(code, "rejected")
+    monkeypatch.setattr(integration_service, "fetch_file", reject)
+    r = api_client.post("/api/v1/analyze", headers=headers, json={
+        "type": "radiology", "radiologyId": "rad-9", "fileUrl": "https://res.cloudinary.com/x/a.png"})
+    assert r.status_code == 422 and r.json()["error"]["code"] == code
+    assert db.query(MedicalAnalysis).count() == 0 and _stored_files(storage_dir) == []
+    assert stub.received == []
+
+
+def test_cross_client_isolation_and_anonymous_access(world, make_client, auth_headers, api_client):
+    _, _, headers = world
+    job = api_client.post("/api/v1/analyze", headers=headers, json={
+        "type": "radiology", "radiologyId": "rad-5", "fileUrl": "https://res.cloudinary.com/x/a.png"}).json()["jobId"]
+    other = make_client("other-hospital-system")
+    assert api_client.get(f"/api/v1/status/{job}", headers=auth_headers(other.api_key)).status_code == 404
+    assert api_client.get(f"/api/v1/status/{job}").status_code == 401
+    assert api_client.post("/api/v1/analyze", json={}).status_code == 401</code></pre>
+<pre><code># tests/integration/test_real_inference.py
+"""Runs real TorchXRayVision inference through the whole flow. Slow (model load)."""
+import io
+
+import pytest
+from PIL import Image
+
+from backend.services import integration_service
+from backend.services.url_fetcher import FetchedFile
+from backend.workers import callbacks
+from tests.support.jeevacare_stub import JeevaCareStub
+
+
+@pytest.mark.slow
+def test_real_xray_inference_reaches_the_callback(monkeypatch, make_client, auth_headers, api_client):
+    reg = make_client()
+    stub = JeevaCareStub(reg.webhook_secret)
+    monkeypatch.setattr(callbacks, "_http_client", stub.client)
+    buf = io.BytesIO()
+    Image.effect_noise((512, 512), 40).convert("L").save(buf, "PNG")
+    monkeypatch.setattr(integration_service, "fetch_file", lambda url, **kw: FetchedFile(
+        content=buf.getvalue(), kind_detected="png", extension=".png"))
+    r = api_client.post("/api/v1/analyze", headers=auth_headers(reg.api_key), json={
+        "type": "radiology", "radiologyId": "real-1", "fileUrl": "https://res.cloudinary.com/x/a.png"})
+    assert r.status_code == 202
+    cb = stub.received[0]
+    assert cb["status"] == "completed"
+    assert len(cb["results"]["findings"]) == 18
+    assert all(0.0 &lt;= f["score"] &lt;= 1.0 for f in cb["results"]["findings"])</code></pre>
+
+<p class="step">- [ ] Step 2: Run to verify behavior</p>
+<p>Run: <code>python -m pytest tests/integration/test_jeevacare_e2e.py -v</code><br>
+Expected: all pass if Tasks 0-9 are correct. Any failure here is a real integration defect: fix the underlying task's code and its own test, not this file. Known risk: eager Celery retries and the <code>on_success</code> hook ordering. If <code>test_radiology_end_to_end</code> sees no callback, confirm the processing task is committed before <code>on_success</code> runs and that <code>AnalysisTask</code> is the <code>base=</code> of both tasks (it is).</p>
+
+<p class="step">- [ ] Step 3: Run the real-inference test</p>
+<p>Run: <code>python -m pytest tests/integration/test_real_inference.py -m slow -v</code><br>Expected: 1 passed (first run may take a minute while the model loads).</p>
+
+<p class="step">- [ ] Step 4: Commit</p>
+<pre><code>git add tests
+git commit -m "test: end-to-end JeevaCare flow against a signature-verifying stub"</code></pre>
+</div>
+
+<!-- ============================ T11 ============================ -->
+<div class="task">
+<h3>Task 11: Contract doc, env template, and final verification</h3>
+<p class="meta"><strong>Requirements:</strong> R13 · Deviations: D1, D2, D7</p>
+<p><strong>Files:</strong></p>
+<ul>
+<li>Create: <code>docs/CLARAMED_API.md</code></li>
+<li>Modify: <code>.env.example</code></li>
+<li>Modify: <code>README.md</code> (link under the JeevaCare section)</li>
+<li>Test: <code>tests/unit/test_contract_doc.py</code></li>
+</ul>
+<p><strong>Relies on:</strong></p>
+<ul>
+<li>EXISTS: backend/core/signing.py verify_signature</li>
+<li>EXISTS: backend/api/routes/integration.py router</li>
+</ul>
+<p><strong>Interfaces:</strong> Consumes the finished API. Produces <code>docs/CLARAMED_API.md</code> that JeevaCare's owner can implement against.</p>
+
+<p class="step">- [ ] Step 1: Write the failing test (the doc must not drift from the code)</p>
+<pre><code># tests/unit/test_contract_doc.py
+from pathlib import Path
+
+from backend.main import app
+
+DOC = Path("docs/CLARAMED_API.md").read_text()
+
+
+def test_every_integration_route_is_documented():
+    paths = {r.path for r in app.routes if r.path.startswith("/api/v1/") and r.path in ("/api/v1/analyze", "/api/v1/status/{job_id}")}
+    assert paths == {"/api/v1/analyze", "/api/v1/status/{job_id}"}
+    assert "POST /api/v1/analyze" in DOC and "GET /api/v1/status/{jobId}" in DOC
+
+
+def test_doc_covers_security_contract():
+    for needle in ("X-ClaraMed-Signature", "X-ClaraMed-Timestamp", "sha256=", "Authorization: Bearer",
+                   "allowed_file_hosts", "host_not_allowed", "blocked_address", "too_large", "bad_content",
+                   "RESULT_RETENTION_DAYS", "CLARAMED_INTEGRATION_ENABLED", "register_client.py"):
+        assert needle in DOC, needle</code></pre>
+
+<p class="step">- [ ] Step 2: Run to verify it fails</p>
+<p>Run: <code>python -m pytest tests/unit/test_contract_doc.py -v</code><br>Expected: FAIL with <code>FileNotFoundError: docs/CLARAMED_API.md</code>.</p>
+
+<p class="step">- [ ] Step 3: Write <code>docs/CLARAMED_API.md</code></p>
+<p>Sections, with the exact content listed:</p>
+<ol>
+<li><strong>Overview and base URL:</strong> <code>https://&lt;host&gt;/api/v1</code>; JeevaCare sets <code>CLARAMED_API_URL</code> to this (D1).</li>
+<li><strong>Registration (operator, once):</strong> <code>python scripts/register_client.py --name jeevacare --webhook-url https://&lt;jeevacare&gt;/api/webhook/claramed-callback --allowed-host res.cloudinary.com</code>; prints the API key and webhook secret once; JeevaCare stores them as <code>CLARAMED_API_KEY</code> and <code>CLARAMED_WEBHOOK_SECRET</code>.</li>
+<li><strong>Auth:</strong> <code>Authorization: Bearer &lt;API key&gt;</code> on every call; scopes <code>analysis:create</code>, <code>analysis:read</code>; all <code>/analyses</code> routes now require it too.</li>
+<li><strong><code>POST /api/v1/analyze</code>:</strong> request body (<code>type</code>, <code>radiologyId</code> xor <code>documentId</code>, <code>fileUrl</code>, <code>patientRef</code>, <code>hospitalRef</code>, <code>metadata</code>), <code>202 {"jobId","status":"queued"}</code>, idempotency on (client, id), file rules (HTTPS, host in <code>allowed_file_hosts</code>, public IP, ≤ <code>MAX_UPLOAD_SIZE_MB</code>, PNG/JPEG for radiology, PDF for documents), no patient name/DOB in URLs.</li>
+<li><strong><code>GET /api/v1/status/{jobId}</code>:</strong> response shape with <code>results</code> (<code>findings[{label,score}]</code>, <code>summary</code>, <code>confidence</code>, <code>disclaimer</code>; documents add <code>explanation</code>), <code>deliveryStatus</code>; 404 for unknown or other clients' jobs.</li>
+<li><strong>Callback:</strong> body schema, headers <code>X-ClaraMed-Timestamp</code> and <code>X-ClaraMed-Signature: sha256=…</code>, signed string <code>"&lt;timestamp&gt;.&lt;raw body&gt;"</code>, reject timestamps older than 300 s, respond 2xx to acknowledge, retry schedule (5 attempts, delays 2/4/8/16 min), then <code>deliveryStatus: "failed"</code> and polling is the fallback. Include this verification example:
+<pre><code>// Node.js (Express): use the RAW body, not the parsed JSON
+import crypto from "node:crypto";
+
+export function verifyClaraMed(req, rawBody, secret) {
+  const ts = req.header("X-ClaraMed-Timestamp");
+  const sig = req.header("X-ClaraMed-Signature") || "";
+  if (!ts || Math.abs(Date.now() / 1000 - Number(ts)) &gt; 300) return false;
+  const expected = "sha256=" + crypto.createHmac("sha256", secret)
+    .update(`${ts}.`).update(rawBody).digest("hex");
+  const a = Buffer.from(expected), b = Buffer.from(sig);
+  return a.length === b.length &amp;&amp; crypto.timingSafeEqual(a, b);
+}</code></pre></li>
+<li><strong>Errors table:</strong> 401, 403, 404, 422 with <code>error.code</code> values <code>invalid_scheme</code>, <code>invalid_url</code>, <code>host_not_allowed</code>, <code>blocked_address</code>, <code>redirect_limit</code>, <code>too_large</code>, <code>bad_content</code>, <code>fetch_failed</code>; 503 when <code>CLARAMED_INTEGRATION_ENABLED=false</code>.</li>
+<li><strong>Data handling:</strong> source file deleted after analysis; results kept <code>RESULT_RETENTION_DAYS</code> (default 30) then purged; failed analyses send <code>error.code = "analysis_failed"</code> with no internals.</li>
+<li><strong>Running it:</strong> API (<code>uvicorn backend.main:app</code>), worker (<code>celery -A backend.workers.celery_app worker --pool=solo -l info</code>), and beat for retention (<code>celery -A backend.workers.celery_app beat -l info</code>); mention <code>SSL_CERT_FILE</code> if the network uses a corporate CA.</li>
+<li><strong>What JeevaCare must still build (not in this repo):</strong> <code>ClaraMedAPIClient</code>, the callback route with signature verification, storing <code>jobId</code> on the radiology record, and the doc's D7 non-goals.</li>
+</ol>
+<pre><code># .env.example additions
+# JeevaCare / client integration
+CLARAMED_INTEGRATION_ENABLED=true
+CALLBACK_MAX_ATTEMPTS=5
+CALLBACK_BACKOFF_BASE_SECONDS=120
+CALLBACK_TIMEOUT_SECONDS=10
+RESULT_RETENTION_DAYS=30
+# JEEVACARE_WEBHOOK_SECRET / JEEVACARE_CALLBACK_URL are deprecated: configure per client via scripts/register_client.py</code></pre>
+
+<p class="step">- [ ] Step 4: Run the full verification</p>
+<p>Run: <code>python -m pytest -q -m "not slow" &amp;&amp; python -m pytest -q -m slow &amp;&amp; python scripts/test_infrastructure.py | tail -12</code><br>
+Expected: all tests pass; infrastructure shows 9/9 (set <code>SSL_CERT_FILE=$HOME/.config/claramed/system-ca.pem</code> for the Groq check). Then start API + worker, register a throwaway client with <code>scripts/register_client.py</code>, and confirm <code>curl -s -o /dev/null -w "%{http_code}" -X POST localhost:8000/api/v1/analyze</code> prints <code>401</code> and an authenticated request with a non-allowlisted URL returns 422 <code>host_not_allowed</code>.</p>
+
+<p class="step">- [ ] Step 5: Commit</p>
+<pre><code>git add docs .env.example README.md tests
+git commit -m "docs: JeevaCare contract (CLARAMED_API.md) and env template"</code></pre>
+</div>
+
+<h2>Self-Review</h2>
+<ul>
+<li><strong>Spec coverage:</strong> every requirement R1-R14 maps to at least one task (see the Spec Coverage table). R12's "no patient values in logs" is enforced by the audit metadata tests in T8 and T9.</li>
+<li><strong>Placeholder scan:</strong> no TBD steps. Two steps defer detail on purpose and say how to settle it: T1 step 4 (inspect the generated migration) and T11 step 3 (document prose, whose required terms are asserted by <code>test_contract_doc.py</code>).</li>
+<li><strong>Type consistency:</strong> <code>FetchedFile</code>/<code>FetchError</code> (T5) match their use in T6 and T10; <code>run_delivery_attempt</code> outcomes (<code>delivered|retry|failed</code>) match T8 tests and T10; <code>finalize_integration_analysis(db, analysis_id, enqueue)</code> matches T7 tests; <code>build_results_payload</code> keys match the T6 status test and the T8 callback body.</li>
+<li><strong>Known risks:</strong> eager-mode Celery retry behavior (T10 notes the fallback: delivery logic is tested without Celery in T8); the documents path depends on <code>DocumentService</code> method names confirmed from <code>tasks.py</code> (<code>extract_text_from_pdf</code>, <code>explain_report</code>, <code>extract_structured_findings</code>); R10 is a breaking change for any unauthenticated caller of <code>/analyses</code>. The only caller found in this repo is <code>frontend/api_client.py</code>, which Task 4 updates to send <code>CLARAMED_API_KEY</code>; the root <code>app.py</code> has no direct calls. Other callers outside this repo are unknown.</li>
+</ul>
+
+<h2>NOT in scope</h2>
+<ul>
+<li>Any change to the JeevaCare repo (<code>ClaraMedAPIClient</code>, callback route, browser deep link). We ship a contract doc and a stub; JeevaCare's owner builds the other half.</li>
+<li>Multipart file upload as a second intake path (kept as a possible later addition; URL intake chosen).</li>
+<li>Choosing and building the production host (Spaces, VM, containers). Only the shared-storage requirement and startup warning are in scope.</li>
+<li>Encrypting <code>webhook_secret</code> and <code>callback_auth_token</code> at rest (TODOS.md).</li>
+<li>A data-processing review of patient text sent to Groq's hosted LLM (TODOS.md, launch gate).</li>
+<li>Symptom analysis on the JeevaCare link, JWT user-context auth, secret rotation, DNS-rebinding IP pinning (D6, D7).</li>
+<li>Fixing the pre-existing broken legacy tests (recorded in <code>tests/KNOWN_FAILURES.md</code>), the legacy Streamlit app beyond sending its API key, and the frontend/production-hardening plans.</li>
+</ul>
+
+<h2>What already exists</h2>
+<table>
+<tr><th>Existing code</th><th>Plan treatment</th></tr>
+<tr><td><code>MedicalAnalysis</code>, <code>UploadedDocument</code>, <code>AnalysisResult</code> models</td><td>Reused; columns added (T1).</td></tr>
+<tr><td><code>process_radiology_async</code>, <code>process_document_async</code></td><td>Reused unchanged except the failed-job guard (A4) and non-retryable errors (A12).</td></tr>
+<tr><td><code>StorageService</code> (save, get, delete)</td><td>Reused for intake and deletion.</td></tr>
+<tr><td><code>IntegrationClient</code>, <code>generate_api_key</code>, <code>hash_api_key</code>, <code>require_scope</code></td><td>Reused and extended; auth lookup simplified (issue 4).</td></tr>
+<tr><td><code>AuditEvent</code> model</td><td>Reused; <code>audit_service.record_event</code> is the first writer.</td></tr>
+<tr><td><code>RadiologyService</code>, <code>DocumentService</code></td><td>Reused; model cache added (A6).</td></tr>
+<tr><td><code>/api/v1/analyses…</code> routes</td><td>Kept; auth made mandatory. Nothing is rebuilt in parallel.</td></tr>
+</table>
+
+<h2>Failure modes</h2>
+<table>
+<tr><th>Codepath</th><th>Realistic failure</th><th>Test</th><th>Handling</th><th>Visible?</th></tr>
+<tr><td><code>/analyze</code> enqueue</td><td>Redis down</td><td>A2</td><td>Roll back, 503</td><td>Clear 503</td></tr>
+<tr><td>URL fetch</td><td>Slow-drip host</td><td>A7</td><td>30 s total deadline</td><td>Clear 422</td></tr>
+<tr><td>Worker</td><td>Process killed mid-job</td><td>A4</td><td>Sweeper fails the job and calls back</td><td>Failed callback</td></tr>
+<tr><td>Worker</td><td>Corrupt scan or PDF</td><td>A12</td><td>No retries; failed callback</td><td>Failed callback</td></tr>
+<tr><td>Callback</td><td>Receiver down or rejects signature</td><td>T8</td><td>5 attempts over ~30 min, then <code>failed</code></td><td>Pollable <code>deliveryStatus</code></td></tr>
+<tr><td>Callback</td><td>Receiver crashes on <code>results: null</code></td><td>(contract doc)</td><td>Documented; launch gate with JeevaCare</td><td>Delivery marked failed</td></tr>
+<tr><td>Finalizer</td><td>File already missing</td><td>T7</td><td>Logged; callback still sent</td><td>None needed</td></tr>
+<tr><td>Hooks</td><td>Eager mode hides a hook that never fires</td><td>A5 spike, A13 smoke</td><td>Fallback to <code>finally</code> path</td><td>Caught before ship</td></tr>
+</table>
+<p>No critical gap remains: every failure above has a test or an explicit handling decision, and none is silent. The one accepted residual risk is the callback-contract mismatch, which only JeevaCare's owner can close (A9 launch gate).</p>
+
+<h2>Parallelization</h2>
+<table>
+<tr><th>Lane</th><th>Tasks</th><th>Modules touched</th></tr>
+<tr><td>A (critical path)</td><td>T0 → T1 → T3 → T4 → T6 → T7/T8/T9 (merged, A1) → T10 → T11</td><td>tests/, backend/models, services, api, workers</td></tr>
+<tr><td>B (independent)</td><td>T2 signing, T5 URL fetcher (incl. A7)</td><td>new files only: backend/core/signing.py, backend/services/url_fetcher.py</td></tr>
+<tr><td>C (independent)</td><td>A6 model cache</td><td>backend/services/radiology_service.py</td></tr>
+</table>
+<p>Lanes B and C can start after T0 and merge before T6 and T10. Lane A is sequential: T7 to T9 share <code>backend/workers/</code>, and T4 and T6 both touch <code>backend/api/</code> and <code>dependencies.py</code>. No two lanes touch the same directory, so there are no conflict flags.</p>
+
+<h2>REVIEW REPORT</h2>
+<table>
+<tr><th>Review</th><th>Trigger</th><th>Why</th><th>Runs</th><th>Status</th><th>Findings</th></tr>
+<tr><td>Eng Review</td><td><code>/plan-eng-review</code></td><td>Architecture &amp; tests (required)</td><td>1</td><td>CLEARED with amendments</td><td>14 decisions: 3 architecture, 1 code quality, 12 test gaps, 2 performance, 6 outside-voice items, 2 TODOs; all applied above</td></tr>
+</table>
+<p><strong>CROSS-MODEL:</strong> the outside voice (Claude subagent) raised 8 findings; 6 led to plan changes (contract field names, callback auth, storage topology, ownerless analyses, non-retryable errors, smoke test and baseline). It disagreed with URL intake; the user kept URL intake.</p>
+<p><strong>VERDICT:</strong> ENG CLEARED, ready to implement after the A9 launch gate is acknowledged (JeevaCare's owner must confirm their callback route accepts the signature scheme before production). CEO review was not run.</p>
+<p>NO UNRESOLVED DECISIONS</p>
+
+</body>
+</html>

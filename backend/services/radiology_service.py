@@ -3,6 +3,7 @@ Radiology AI Service using TorchXRayVision
 
 Handles chest X-ray analysis using pretrained deep learning models.
 """
+import threading
 from typing import Dict, Any, List, Optional
 from pathlib import Path
 from datetime import datetime
@@ -15,6 +16,10 @@ from backend.core.logging import get_logger
 from backend.core.exceptions import ModelError, ProcessingError, ValidationError
 
 logger = get_logger(__name__)
+
+# One loaded model per (name, device) per process: loading DenseNet on every job is slow and wasteful.
+_MODEL_CACHE: Dict[tuple, tuple] = {}
+_MODEL_LOCK = threading.Lock()
 
 
 class RadiologyService:
@@ -29,11 +34,26 @@ class RadiologyService:
     
     def load_model(self) -> bool:
         """
-        Load TorchXRayVision model.
+        Load TorchXRayVision model, reusing the process-wide cached copy when present.
         
         Returns:
             True if model loaded successfully
         """
+        if self.model_loaded:
+            return True
+        key = (self.model_name, self.device)
+        with _MODEL_LOCK:
+            cached = _MODEL_CACHE.get(key)
+            if cached is None:
+                self._load_uncached()
+                _MODEL_CACHE[key] = (self.model, self.supported_labels)
+            else:
+                self.model, self.supported_labels = cached
+                self.model_loaded = True
+        return True
+    
+    def _load_uncached(self) -> bool:
+        """Load the model from disk/network into this instance."""
         if self.model_loaded:
             logger.info(f"Model already loaded: {self.model_name}")
             return True

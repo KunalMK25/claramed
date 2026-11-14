@@ -3,6 +3,7 @@ ClaraMed Security and Authentication
 """
 import secrets
 import hashlib
+import hmac
 from datetime import datetime, timedelta
 from typing import Optional
 from jose import JWTError, jwt
@@ -27,7 +28,7 @@ def hash_api_key(api_key: str) -> str:
 
 def verify_api_key(plain_key: str, hashed_key: str) -> bool:
     """Verify an API key against its hash."""
-    return hash_api_key(plain_key) == hashed_key
+    return hmac.compare_digest(hash_api_key(plain_key), hashed_key)
 
 
 def hash_password(password: str) -> str:

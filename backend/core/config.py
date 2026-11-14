@@ -69,6 +69,13 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
     
     # Integration
+    CLARAMED_INTEGRATION_ENABLED: bool = True
+    CALLBACK_MAX_ATTEMPTS: int = 5
+    CALLBACK_BACKOFF_BASE_SECONDS: int = 120  # 120+240+480+960 = 30 min between 5 attempts
+    CALLBACK_TIMEOUT_SECONDS: int = 10
+    RESULT_RETENTION_DAYS: int = 30
+    STALE_JOB_SECONDS: int = 1800
+    # Deprecated, unused: per-client webhook settings now live on IntegrationClient
     JEEVACARE_WEBHOOK_SECRET: Optional[str] = None
     JEEVACARE_CALLBACK_URL: Optional[str] = None
     
@@ -79,6 +86,14 @@ class Settings(BaseSettings):
     RATE_LIMIT_PER_MINUTE: int = 10
     RATE_LIMIT_PER_HOUR: int = 100
     
+    @validator("DATABASE_URL")
+    def pin_psycopg2_driver(cls, v):
+        # SQLAlchemy may default to psycopg3 for plain postgresql:// URLs;
+        # this project depends on psycopg2.
+        if v.startswith("postgresql://"):
+            return v.replace("postgresql://", "postgresql+psycopg2://", 1)
+        return v
+
     @validator("SUPPORTED_LANGUAGES")
     def parse_languages(cls, v):
         if isinstance(v, str):
@@ -112,6 +127,14 @@ class Settings(BaseSettings):
 
 
 # Global settings instance
+def storage_topology_warning(app_env: str, provider: str) -> str | None:
+    """Warn when local storage is used in production: the API and the worker must see the same files."""
+    if app_env == "production" and provider == "local":
+        return ("STORAGE_PROVIDER=local in production: the API and the Celery worker must share the same "
+                "volume, or use STORAGE_PROVIDER=s3. Files written by the API are otherwise invisible to the worker.")
+    return None
+
+
 settings = Settings()
 
 

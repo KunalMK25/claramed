@@ -73,6 +73,10 @@ class ProcessingError(ClaraMedException):
         )
 
 
+class CorruptDocumentError(ProcessingError):
+    """The uploaded document is unreadable. Deterministic: retrying cannot help."""
+
+
 class ModelError(ClaraMedException):
     """AI model error exception."""
     

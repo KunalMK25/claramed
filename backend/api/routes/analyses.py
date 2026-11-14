@@ -11,7 +11,7 @@ import tempfile
 from pathlib import Path
 
 from backend.database.connection import get_db
-from backend.api.dependencies import get_current_client, check_analysis_access
+from backend.api.dependencies import require_authentication, check_analysis_access
 from backend.models.analysis import MedicalAnalysis, AnalysisStatus, AnalysisType
 from backend.models.result import AnalysisResult, ResultType
 from backend.models.document import UploadedDocument, DocumentType
@@ -44,7 +44,7 @@ router = APIRouter()
 async def create_symptom_analysis(
     request: SymptomAnalysisRequest,
     db: Session = Depends(get_db),
-    client: Optional[IntegrationClient] = Depends(get_current_client),
+    client: IntegrationClient = Depends(require_authentication),
 ):
     """
     Create a new symptom analysis.
@@ -163,7 +163,7 @@ async def create_symptom_analysis(
 async def get_analysis_status(
     analysis_id: str,
     db: Session = Depends(get_db),
-    client: Optional[IntegrationClient] = Depends(get_current_client),
+    client: IntegrationClient = Depends(require_authentication),
 ):
     """
     Get analysis status by ID.
@@ -211,7 +211,7 @@ async def get_analysis_status(
 async def get_analysis_results(
     analysis_id: str,
     db: Session = Depends(get_db),
-    client: Optional[IntegrationClient] = Depends(get_current_client),
+    client: IntegrationClient = Depends(require_authentication),
 ):
     """
     Get complete analysis results.
@@ -283,7 +283,7 @@ async def list_analyses(
     page_size: int = 20,
     analysis_type: Optional[AnalysisType] = None,
     db: Session = Depends(get_db),
-    client: Optional[IntegrationClient] = Depends(get_current_client),
+    client: IntegrationClient = Depends(require_authentication),
 ):
     """
     List analyses with pagination.
@@ -349,7 +349,7 @@ async def upload_document(
     analysis_id: str,
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
-    client: Optional[IntegrationClient] = Depends(get_current_client),
+    client: IntegrationClient = Depends(require_authentication),
 ):
     """
     Upload a medical document for analysis.
@@ -510,7 +510,7 @@ async def upload_radiology_image(
     analysis_id: str,
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
-    client: Optional[IntegrationClient] = Depends(get_current_client),
+    client: IntegrationClient = Depends(require_authentication),
 ):
     """
     Upload a chest X-ray image for radiology AI analysis.
