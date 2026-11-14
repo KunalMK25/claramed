@@ -102,12 +102,13 @@ def test_redis():
     try:
         import redis
         
-        # redis-py 4.6.0 uses RESP2 by default (no protocol parameter)
+        # redis-py 8.x with RESP2 for Redis 3.x compatibility
         r = redis.StrictRedis(
             host='localhost',
             port=6379,
             db=0,
-            decode_responses=True
+            decode_responses=True,
+            protocol=2  # Force RESP2 for Redis 3.x
         )
         
         # Test PING

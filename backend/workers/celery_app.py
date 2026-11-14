@@ -11,13 +11,12 @@ from backend.core.logging import configure_logging, get_logger
 configure_logging()
 logger = get_logger(__name__)
 
-# Create Celery app with Redis 3.x compatible URL
-# Use sentinel:// scheme which forces older protocol compatibility
+# Create Celery app
 celery_app = Celery(
     "claramed",
 )
 
-# Set broker and backend separately to avoid RESP3 issues
+# Set broker and backend URLs
 celery_app.conf.broker_url = settings.REDIS_URL
 celery_app.conf.result_backend = settings.REDIS_URL
 
@@ -34,15 +33,21 @@ celery_app.conf.update(
     worker_prefetch_multiplier=1,
     worker_max_tasks_per_child=50,
     broker_connection_retry_on_startup=True,
-    # Redis 3.x compatible transport options
+    # Redis 8.x with RESP2 protocol for Redis 3.x compatibility
     broker_transport_options={
         'visibility_timeout': 3600,
         'fanout_prefix': True,
         'fanout_patterns': True,
         'max_connections': 10,
+        'connection_kwargs': {
+            'protocol': 2,  # Force RESP2
+        }
     },
     result_backend_transport_options={
         'max_connections': 10,
+        'connection_kwargs': {
+            'protocol': 2,  # Force RESP2
+        }
     },
     # Use Redis sentinel compatibility mode
     broker_use_ssl=False,
