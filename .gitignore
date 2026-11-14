@@ -5,3 +5,5 @@ __pycache__/
 claramd.db
 venv/
 test.db
+backups/
+.env.production

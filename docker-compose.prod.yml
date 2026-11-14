@@ -1,0 +1,167 @@
+# ClaraMed production stack for ONE VM (Docker Compose). See docs/DEPLOYMENT.md.
+#
+#   internet -> caddy (80/443, automatic HTTPS) -> api -> postgres, redis
+#                                                   worker, beat -> postgres, redis, storage volume
+#
+# Only caddy publishes ports. Postgres, Redis and the API are reachable only on the internal network.
+# Start with:  docker compose -f docker-compose.prod.yml --env-file .env up -d --build
+
+name: claramed
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+x-app: &app
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: claramed-app:latest
+  env_file: .env
+  restart: unless-stopped
+  logging: *logging
+  environment: &app-env
+    APP_ENV: production
+    DEBUG: "false"
+    DATABASE_URL: postgresql://claramed:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/claramed
+    REDIS_URL: redis://redis:6379/0
+    STORAGE_PROVIDER: local
+    STORAGE_LOCAL_PATH: /app/storage
+    # The api and worker mount the same named volume below, so local storage is safe here.
+    STORAGE_SHARED_CONFIRMED: "true"
+    TESSERACT_CMD: tesseract
+  volumes:
+    - storage:/app/storage
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      POSTGRES_DB: claramed
+      POSTGRES_USER: claramed
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U claramed -d claramed"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    logging: *logging
+    # Persist the queue so jobs survive a restart of this container.
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+  # One-shot: apply database migrations, then exit. api/worker/beat wait for it to succeed.
+  migrate:
+    <<: *app
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    <<: *app
+    command: ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000",
+              "--workers", "2", "--proxy-headers", "--forwarded-allow-ips", "*"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # Runs the OCR / X-ray jobs and the signed callbacks. Each process holds the model in memory
+  # (about 1 GB), so keep WORKER_CONCURRENCY small and size the VM accordingly.
+  worker:
+    <<: *app
+    command: ["celery", "-A", "backend.workers.celery_app", "worker", "--loglevel=info",
+              "--concurrency=${WORKER_CONCURRENCY:-1}"]
+    mem_limit: ${WORKER_MEMORY_LIMIT:-3g}
+    stop_grace_period: 120s
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A backend.workers.celery_app inspect ping -d celery@$$HOSTNAME"]
+      interval: 60s
+      timeout: 20s
+      retries: 3
+      start_period: 90s
+
+  # Scheduler: hourly purge of expired results and the 10-minute stale-job sweeper. Run exactly one.
+  beat:
+    <<: *app
+    command: ["celery", "-A", "backend.workers.celery_app", "beat", "--loglevel=info",
+              "--schedule", "/tmp/celerybeat-schedule"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    logging: *logging
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      CLARAMED_DOMAIN: ${CLARAMED_DOMAIN:?set CLARAMED_DOMAIN in .env}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      api:
+        condition: service_healthy
+
+  # Optional Streamlit UI: `docker compose --profile ui ... up -d`. Reachable only from this VM
+  # (use an SSH tunnel); it is not exposed through Caddy.
+  ui:
+    profiles: ["ui"]
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      BACKEND_URL: http://api:8000
+      CLARAMED_API_KEY: ${CLARAMED_UI_API_KEY:-}
+    ports:
+      - "127.0.0.1:8501:8501"
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  redisdata:
+  storage:
+  caddy_data:
+  caddy_config:

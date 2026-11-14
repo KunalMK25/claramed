@@ -7,6 +7,12 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 import os
 
 
+PRODUCTION = "production"
+# Placeholder secrets shipped in .env.example / the defaults below; never acceptable in production.
+DEFAULT_API_KEY_HASH_SECRET = "change_this_to_a_secure_random_string"
+DEFAULT_SECRET_KEY = "change_this_to_a_secure_random_string_for_jwt"
+
+
 class Settings(BaseSettings):
     """Application settings with environment variable support."""
     
@@ -51,6 +57,8 @@ class Settings(BaseSettings):
     # File Storage
     STORAGE_PROVIDER: str = "local"
     STORAGE_LOCAL_PATH: str = "./storage"
+    # Set true when the API and the Celery worker are known to mount the same storage volume
+    STORAGE_SHARED_CONFIRMED: bool = False
     STORAGE_BUCKET: str = "claramed-uploads"
     STORAGE_ENDPOINT: Optional[str] = None
     STORAGE_REGION: str = "us-east-1"
@@ -63,8 +71,8 @@ class Settings(BaseSettings):
     MAX_IMAGE_DIMENSION: int = 4096
     
     # Security
-    API_KEY_HASH_SECRET: str = "change_this_to_a_secure_random_string"
-    SECRET_KEY: str = "change_this_to_a_secure_random_string_for_jwt"
+    API_KEY_HASH_SECRET: str = DEFAULT_API_KEY_HASH_SECRET
+    SECRET_KEY: str = DEFAULT_SECRET_KEY
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
     
@@ -117,22 +125,40 @@ class Settings(BaseSettings):
         if not self.GROQ_API_KEY or self.GROQ_API_KEY == "your_groq_api_key_here":
             missing.append("GROQ_API_KEY")
         
-        if self.API_KEY_HASH_SECRET == "change_this_to_a_secure_random_string":
+        if self.API_KEY_HASH_SECRET == DEFAULT_API_KEY_HASH_SECRET:
             missing.append("API_KEY_HASH_SECRET (use a secure random string)")
         
-        if self.SECRET_KEY == "change_this_to_a_secure_random_string_for_jwt":
+        if self.SECRET_KEY == DEFAULT_SECRET_KEY:
             missing.append("SECRET_KEY (use a secure random string)")
         
         return missing
 
 
 # Global settings instance
-def storage_topology_warning(app_env: str, provider: str) -> str | None:
+def storage_topology_warning(app_env: str, provider: str, shared_volume_confirmed: bool = False) -> str | None:
     """Warn when local storage is used in production: the API and the worker must see the same files."""
-    if app_env == "production" and provider == "local":
+    if app_env == PRODUCTION and provider == "local" and not shared_volume_confirmed:
         return ("STORAGE_PROVIDER=local in production: the API and the Celery worker must share the same "
-                "volume, or use STORAGE_PROVIDER=s3. Files written by the API are otherwise invisible to the worker.")
+                "volume, or use STORAGE_PROVIDER=s3. Files written by the API are otherwise invisible to the worker. "
+                "Set STORAGE_SHARED_CONFIRMED=true once they do.")
     return None
+
+
+_DEFAULT_SECRETS = {DEFAULT_API_KEY_HASH_SECRET, DEFAULT_SECRET_KEY}
+MIN_SECRET_LENGTH = 32
+
+
+def production_config_errors(app_env: str, debug: bool, api_key_hash_secret: str, secret_key: str) -> list[str]:
+    """Reasons the app must refuse to start in production. Empty list = fine."""
+    if app_env != PRODUCTION:
+        return []
+    errors = []
+    if debug:
+        errors.append("DEBUG must be false in production (it enables CORS '*' and SQL logging)")
+    for name, value in (("API_KEY_HASH_SECRET", api_key_hash_secret), ("SECRET_KEY", secret_key)):
+        if value in _DEFAULT_SECRETS or len(value) < MIN_SECRET_LENGTH:
+            errors.append(f"{name} must be set to a random value of at least {MIN_SECRET_LENGTH} characters")
+    return errors
 
 
 settings = Settings()

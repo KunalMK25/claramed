@@ -37,6 +37,7 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: claramed_backend
+    command: sh -c "alembic upgrade head && uvicorn backend.main:app --host 0.0.0.0 --port 8000"
     environment:
       APP_ENV: development
       DATABASE_URL: postgresql://claramed:claramed_dev_password@postgres:5432/claramed

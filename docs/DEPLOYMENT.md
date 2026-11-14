@@ -1,5 +1,7 @@
 # ClaraMed Deployment Guide
 
+> This is the local-development guide. **For production on a single VM, use [DEPLOYMENT_VM.md](DEPLOYMENT_VM.md).**
+
 ## Prerequisites
 
 - Docker and Docker Compose

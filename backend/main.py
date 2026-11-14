@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 import time
 import uuid
 
-from backend.core.config import settings, storage_topology_warning
+from backend.core.config import settings, storage_topology_warning, production_config_errors
 from backend.core.logging import configure_logging, get_logger
 from backend.core.exceptions import ClaraMedException
 from backend.api.routes import health, analyses, integration
@@ -30,7 +30,13 @@ async def lifespan(app: FastAPI):
     logger.info(f"Environment: {settings.APP_ENV}")
     logger.info("=" * 60)
     
-    topology = storage_topology_warning(settings.APP_ENV, settings.STORAGE_PROVIDER)
+    problems = production_config_errors(
+        settings.APP_ENV, settings.DEBUG, settings.API_KEY_HASH_SECRET, settings.SECRET_KEY)
+    if problems:
+        raise RuntimeError("Refusing to start with an unsafe production configuration: " + "; ".join(problems))
+    
+    topology = storage_topology_warning(
+        settings.APP_ENV, settings.STORAGE_PROVIDER, settings.STORAGE_SHARED_CONFIRMED)
     if topology:
         logger.warning(topology)
     

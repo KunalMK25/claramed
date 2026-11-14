@@ -65,4 +65,11 @@ Thumbs.db
 
 # Misc
 .agents/
-migrations/versions/
+
+# Never ship these
+backups/
+.slash-cli/
+tests/
+deploy/
+*.rar
+*.zip

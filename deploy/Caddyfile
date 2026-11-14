@@ -1,0 +1,24 @@
+# Caddy obtains and renews the HTTPS certificate for CLARAMED_DOMAIN automatically.
+# Prerequisites: the domain's DNS A/AAAA record points at this VM, and ports 80 and 443 are open.
+{$CLARAMED_DOMAIN} {
+	encode gzip
+
+	# The bundled upload routes accept files up to MAX_UPLOAD_SIZE_MB (10); allow headroom for the multipart envelope.
+	request_body {
+		max_size 15MB
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+
+	reverse_proxy api:8000 {
+		health_uri /api/v1/health
+		health_interval 30s
+		header_up X-Forwarded-Proto {scheme}
+	}
+}

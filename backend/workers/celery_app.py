@@ -5,6 +5,7 @@ Configures Celery for background task processing.
 Compatible with Redis 3.x on Windows.
 """
 from celery import Celery
+from celery.signals import worker_process_init
 from backend.core.config import settings
 from backend.core.logging import configure_logging, get_logger
 
@@ -72,3 +73,11 @@ celery_app.autodiscover_tasks(["backend.workers"])
 celery_app.autodiscover_tasks(["backend.workers"], related_name="callbacks")
 
 logger.info("Celery app configured")
+
+
+@worker_process_init.connect
+def _reset_database_pool(**_kwargs):
+    """Prefork children inherit the parent's connection pool; sharing live connections across processes
+    corrupts them. Discard (without closing the parent's sockets) so each child opens its own."""
+    from backend.database.connection import engine
+    engine.dispose(close=False)
