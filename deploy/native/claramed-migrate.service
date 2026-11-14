@@ -1,0 +1,22 @@
+[Unit]
+Description=ClaraMed database migrations (alembic upgrade head)
+After=postgresql.service
+Requires=postgresql.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=claramed
+Group=claramed
+WorkingDirectory=/opt/claramed/app
+EnvironmentFile=/etc/claramed/claramed.env
+Environment=HOME=/var/lib/claramed
+ExecStart=/opt/claramed/venv/bin/alembic upgrade head
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/claramed
+
+[Install]
+WantedBy=multi-user.target

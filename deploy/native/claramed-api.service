@@ -1,0 +1,23 @@
+[Unit]
+Description=ClaraMed API (behind Caddy)
+After=network.target postgresql.service redis-server.service claramed-migrate.service
+Requires=postgresql.service redis-server.service claramed-migrate.service
+
+[Service]
+Type=simple
+User=claramed
+Group=claramed
+WorkingDirectory=/opt/claramed/app
+EnvironmentFile=/etc/claramed/claramed.env
+Environment=HOME=/var/lib/claramed
+ExecStart=/opt/claramed/venv/bin/uvicorn backend.main:app --host 127.0.0.1 --port 8000 --workers 2 --proxy-headers --forwarded-allow-ips 127.0.0.1
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/claramed
+
+[Install]
+WantedBy=multi-user.target

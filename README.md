@@ -254,7 +254,7 @@ ClaraMed is designed for future integration with JeevaCare healthcare platform w
 - Service-to-service authentication
 - Webhook notifications (optional)
 
-Production deployment (one VM, Docker Compose): [docs/DEPLOYMENT_VM.md](docs/DEPLOYMENT_VM.md).
+Production deployment: one VM with Docker Compose ([docs/DEPLOYMENT_VM.md](docs/DEPLOYMENT_VM.md)) or native on an Oracle free VM without Docker ([docs/DEPLOYMENT_NATIVE.md](docs/DEPLOYMENT_NATIVE.md)).
 See [docs/CLARAMED_API.md](docs/CLARAMED_API.md) for the client integration contract (submit, status, signed callbacks)
 and [BUILD.md](BUILD.md) for the original specification.
 

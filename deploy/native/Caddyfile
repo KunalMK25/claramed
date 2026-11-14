@@ -1,0 +1,23 @@
+# Installed to /etc/caddy/Caddyfile. Replace claramed.example.com with your domain (DNS must point at this VM);
+# Caddy then obtains and renews the HTTPS certificate by itself.
+claramed.example.com {
+	encode gzip
+
+	request_body {
+		max_size 15MB
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+
+	reverse_proxy 127.0.0.1:8000 {
+		health_uri /api/v1/health
+		health_interval 30s
+		header_up X-Forwarded-Proto {scheme}
+	}
+}

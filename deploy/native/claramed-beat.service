@@ -1,0 +1,23 @@
+[Unit]
+Description=ClaraMed Celery scheduler (purge expired results, sweep stale jobs). Run exactly one.
+After=network.target postgresql.service redis-server.service claramed-migrate.service
+Requires=postgresql.service redis-server.service claramed-migrate.service
+
+[Service]
+Type=simple
+User=claramed
+Group=claramed
+WorkingDirectory=/opt/claramed/app
+EnvironmentFile=/etc/claramed/claramed.env
+Environment=HOME=/var/lib/claramed
+ExecStart=/opt/claramed/venv/bin/celery -A backend.workers.celery_app beat --loglevel=info --schedule /var/lib/claramed/celerybeat-schedule
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/claramed
+
+[Install]
+WantedBy=multi-user.target

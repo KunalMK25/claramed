@@ -93,7 +93,7 @@ services:
       start_period: 60s
 
   # Runs the OCR / X-ray jobs and the signed callbacks. Each process holds the model in memory
-  # (about 1 GB), so keep WORKER_CONCURRENCY small and size the VM accordingly.
+  # (about 0.55 GB), so keep WORKER_CONCURRENCY small and size the VM accordingly.
   worker:
     <<: *app
     command: ["celery", "-A", "backend.workers.celery_app", "worker", "--loglevel=info",

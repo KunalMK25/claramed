@@ -1,6 +1,6 @@
 # Deploying ClaraMed on one VM (Docker Compose)
 
-Production runbook for a single Linux VM. Everything runs in containers: Caddy (HTTPS), the API, the Celery
+Production runbook for a single Linux VM. (No Docker? See `docs/DEPLOYMENT_NATIVE.md` for the native install on an Oracle free VM.) Everything runs in containers: Caddy (HTTPS), the API, the Celery
 worker, the Celery scheduler, Redis and PostgreSQL. For local development use `docker-compose.yml` and
 `docs/DEPLOYMENT.md` instead.
 
@@ -26,11 +26,11 @@ which is what makes local file storage safe here.
 | Resource | Minimum | Comfortable |
 |----------|---------|-------------|
 | CPU | 2 vCPU | 4 vCPU |
-| RAM | 4 GB | 8 GB (each worker process holds the X-ray model, about 1 GB) |
+| RAM | 2 GB (tight) | 4 GB or more (measured: one worker process peaks at about 0.55 GB; API, Postgres, Redis and the OS need roughly 1 GB more) |
 | Disk | 30 GB | 60 GB (image is several GB; Postgres, uploads and backups grow) |
 | OS | Ubuntu 22.04 / 24.04, x86_64 or ARM64 | |
 
-X-ray inference runs on the CPU and takes seconds per image. Raise `WORKER_CONCURRENCY` only together with RAM.
+X-ray inference runs on the CPU and takes seconds per image. Each extra worker process (`WORKER_CONCURRENCY`) adds about 0.55 GB, so raise it only together with RAM.
 
 ## 3. Before you start
 

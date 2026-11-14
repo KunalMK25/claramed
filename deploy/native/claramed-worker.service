@@ -1,0 +1,27 @@
+[Unit]
+Description=ClaraMed Celery worker (OCR, X-ray inference, callbacks)
+After=network.target postgresql.service redis-server.service claramed-migrate.service
+Requires=postgresql.service redis-server.service claramed-migrate.service
+
+[Service]
+Type=simple
+User=claramed
+Group=claramed
+WorkingDirectory=/opt/claramed/app
+EnvironmentFile=/etc/claramed/claramed.env
+Environment=HOME=/var/lib/claramed
+ExecStart=/opt/claramed/venv/bin/celery -A backend.workers.celery_app worker --loglevel=info --concurrency=${WORKER_CONCURRENCY}
+Restart=always
+RestartSec=5
+# Let a running job finish on restart before systemd kills it.
+TimeoutStopSec=120
+# Each worker process holds the X-ray model (measured peak about 0.55 GB); a runaway job must not take the VM down.
+MemoryMax=3G
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/claramed
+
+[Install]
+WantedBy=multi-user.target
