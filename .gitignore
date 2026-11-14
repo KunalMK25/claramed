@@ -8,3 +8,4 @@ test.db
 backups/
 .env.production
 claramed.db
+.slash-cli/

@@ -68,7 +68,6 @@ Thumbs.db
 
 # Never ship these
 backups/
-.slash-cli/
 tests/
 deploy/
 *.rar
