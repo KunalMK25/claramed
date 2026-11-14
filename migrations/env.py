@@ -27,8 +27,9 @@ from backend.models import (
 # this is the Alembic Config object
 config = context.config
 
-# Override sqlalchemy.url with our settings
-config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
+# Override sqlalchemy.url with our settings (escape % for ConfigParser)
+database_url = settings.DATABASE_URL.replace('%', '%%')
+config.set_main_option("sqlalchemy.url", database_url)
 
 # Interpret the config file for Python logging.
 if config.config_file_name is not None:
