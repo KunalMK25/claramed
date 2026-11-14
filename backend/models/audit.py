@@ -29,8 +29,8 @@ class AuditEvent(Base):
     outcome = Column(String(20), nullable=False, index=True)  # success, failure, denied
     error_message = Column(String(500), nullable=True)
     
-    # Metadata
-    metadata = Column(JSON, nullable=True)
+    # Additional context (renamed from 'metadata' to avoid SQLAlchemy reserved name)
+    event_metadata = Column(JSON, nullable=True)
     
     # Timestamp
     timestamp = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
