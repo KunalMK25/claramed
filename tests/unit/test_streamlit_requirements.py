@@ -1,4 +1,5 @@
-"""The Streamlit app installs ONLY streamlit_app/requirements.txt. Keep it complete and lean."""
+"""Streamlit Community Cloud installs the ROOT requirements.txt for the root app.py. Keep it complete and lean;
+the backend (API, worker) uses requirements-backend.txt instead."""
 import ast
 import re
 import sys
@@ -6,17 +7,14 @@ import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-APP = ROOT / "streamlit_app"
-ENTRY_POINTS = [APP / "app.py", APP / "pages" / "1_Radiology_AI.py"]
+ENTRY_POINTS = [ROOT / "app.py"]
 FIRST_PARTY = {"backend", "streamlit_app", "chains", "database"}
 IMPORT_TO_DIST = {"PIL": "pillow", "skimage": "scikit-image", "PyPDF2": "pypdf2", "yaml": "pyyaml"}
 BACKEND_ONLY = {"celery", "sqlalchemy", "psycopg2", "psycopg2-binary", "redis", "alembic", "boto3"}
 
 
 def _first_party_file(module: str) -> Path | None:
-    top = module.split(".")[0]
-    base = APP if top in {"chains", "database"} else ROOT
-    path = base / Path(*module.split("."))
+    path = ROOT / Path(*module.split("."))
     for candidate in (path.with_suffix(".py"), path / "__init__.py"):
         if candidate.exists():
             return candidate
@@ -49,7 +47,7 @@ def third_party_imports() -> set[str]:
 
 def requirement_names() -> set[str]:
     names = set()
-    for line in (APP / "requirements.txt").read_text().splitlines():
+    for line in (ROOT / "requirements.txt").read_text().splitlines():
         line = line.strip()
         if line and not line.startswith(("#", "-")):
             names.add(re.split(r"[<>=!~\[ ;]", line)[0].lower().replace("_", "-"))
@@ -59,7 +57,7 @@ def requirement_names() -> set[str]:
 def test_every_third_party_import_is_installed():
     needed = {IMPORT_TO_DIST.get(m, m).lower().replace("_", "-") for m in third_party_imports()}
     missing = sorted(needed - requirement_names())
-    assert missing == [], f"add these to streamlit_app/requirements.txt: {missing}"
+    assert missing == [], f"add these to the root requirements.txt: {missing}"
 
 
 def test_the_closure_walk_really_reaches_the_heavy_imports():
@@ -72,7 +70,7 @@ def test_backend_only_packages_are_not_installed():
 
 
 def test_pytorch_comes_from_the_cpu_index():
-    first = (APP / "requirements.txt").read_text().splitlines()[0]
+    first = (ROOT / "requirements.txt").read_text().splitlines()[0]
     assert first.strip() == "--extra-index-url https://download.pytorch.org/whl/cpu"
 
 
@@ -83,11 +81,20 @@ def test_uploads_are_capped_at_ten_megabytes_and_the_theme_is_kept():
 
 
 def test_secrets_template_has_placeholders_only():
-    text = (APP / "secrets.toml.example").read_text()
+    text = (ROOT / ".streamlit" / "secrets.toml.example").read_text()
     assert "GROQ_API_KEY" in text and "JEEVACARE_URL" in text
     assert not re.search(r"gsk_[A-Za-z0-9]{10,}", text)
 
 
-def test_dev_frontend_image_runs_the_new_entry_point_and_the_lean_list():
+def test_dev_frontend_image_runs_the_root_app_with_the_lean_list():
     text = (ROOT / "Dockerfile.frontend").read_text()
-    assert "streamlit_app/app.py" in text and "streamlit_app/requirements.txt" in text
+    assert "streamlit run app.py" in text and "COPY requirements.txt" in text
+
+
+def test_backend_dependencies_live_in_requirements_backend_txt():
+    backend = (ROOT / "requirements-backend.txt").read_text().lower()
+    assert "celery" in backend and "sqlalchemy" in backend and "uvicorn" in backend
+    assert "requirements-backend.txt" in (ROOT / "Dockerfile").read_text()
+    assert "requirements-backend.txt" in (ROOT / "scripts" / "update_native.sh").read_text()
+    assert "requirements-backend.txt" in (ROOT / "docs" / "DEPLOYMENT_NATIVE.md").read_text()
+    assert "-r requirements-backend.txt" in (ROOT / "requirements-dev.txt").read_text()

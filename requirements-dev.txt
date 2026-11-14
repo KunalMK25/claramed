@@ -1,4 +1,4 @@
--r requirements.txt
+-r requirements-backend.txt
 
 # Development Tools
 black>=23.0.0

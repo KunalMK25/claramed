@@ -5,6 +5,17 @@ Supersedes `2026-11-14-streamlit-only-design.md` (signed launch token + automati
 replaced with a simpler model, and replaces the hosting model of `2026-11-14-jeevacare-linking-design.md`
 for this deployment (that API stack stays in the repo, unused here).
 
+## Revision (later on 2026-11-14): ONE link, root entry point
+After the first deploy attempt (the move to `streamlit_app/app.py` broke the existing Streamlit Cloud setting that runs
+`app.py`), the design was simplified: there is only ONE address, the main ClaraMed URL, and nothing else to remember.
+- `app.py` (plus `chains.py`, `database.py`) is back at the repo root; Streamlit Cloud needs no setting changes for it.
+- Radiology AI is the FIRST TAB of that one page (`streamlit_app/radiology_tab.py`); there is no `/Radiology_AI` page.
+- The root `requirements.txt` is now the lean Streamlit list; the API/worker list is `requirements-backend.txt`.
+- `.streamlit/secrets.toml.example` holds the secrets template.
+- JeevaCare's link is the bare ClaraMed address (`VITE_CLARAMED_BASE_URL`), no path.
+Where this section conflicts with the text below (page path `/Radiology_AI`, `streamlit_app/` as entry point, R2's page
+wording, R8/R9 file locations), this section wins.
+
 ## Problem
 The user wants ClaraMed and JeevaCare to be two separate sites, linked the way a map link opens Google Maps: a
 "Radiology AI" item in JeevaCare's sidebar takes the user to the ClaraMed website. ClaraMed does not store or

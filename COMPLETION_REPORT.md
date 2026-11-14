@@ -274,7 +274,7 @@ Open: http://localhost:8000/docs
 
 3. **Install Dependencies**
    ```powershell
-   pip install -r requirements.txt
+   pip install -r requirements-backend.txt
    ```
 
 4. **Configure Environment**

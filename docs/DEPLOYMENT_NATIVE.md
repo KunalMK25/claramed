@@ -115,7 +115,7 @@ UV_PYTHON_INSTALL_DIR=/opt/uv-python /root/.local/bin/uv venv --seed --python 3.
 chown -R claramed:claramed /opt/claramed
 exit
 sudo -u claramed /opt/claramed/venv/bin/python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-sudo -u claramed /opt/claramed/venv/bin/python -m pip install -r /opt/claramed/app/requirements.txt
+sudo -u claramed /opt/claramed/venv/bin/python -m pip install -r /opt/claramed/app/requirements-backend.txt
 
 # download the X-ray model weights once, so the first job does not have to
 sudo -u claramed HOME=/var/lib/claramed /opt/claramed/venv/bin/python -c \

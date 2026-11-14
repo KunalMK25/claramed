@@ -5,6 +5,7 @@ import PyPDF2
 import pandas as pd
 from chains import get_symptom_chain, get_emergency_chain, get_report_explainer_chain, get_wellness_tips_chain
 from database import init_db, save_history, get_history, clear_history
+from streamlit_app.radiology_tab import render_radiology_tab
 
 # Initialize SQLite Database
 init_db()
@@ -442,7 +443,11 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # Create Tabs (Symptom Checker, Report Explainer, and Symptom History)
-tab1, tab2, tab3 = st.tabs(["Symptom Checker", "Report Explainer", "📊 Symptom History"])
+# Radiology AI is first: it is where the "Radiology AI" link in JeevaCare lands.
+tab_radiology, tab1, tab2, tab3 = st.tabs(["🩻 Radiology AI", "Symptom Checker", "Report Explainer", "📊 Symptom History"])
+
+with tab_radiology:
+    render_radiology_tab()
 
 # Tab 1: Symptom Checker
 with tab1:

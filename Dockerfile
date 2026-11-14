@@ -22,10 +22,10 @@ RUN useradd --create-home --uid 10001 app
 WORKDIR /app
 
 # CPU-only PyTorch first (the default PyPI wheel pulls multi-GB CUDA libraries this deployment cannot use),
-# then everything else; requirements.txt's torch>=2.0.0 is already satisfied.
-COPY requirements.txt .
+# then everything else; requirements-backend.txt's torch>=2.0.0 is already satisfied.
+COPY requirements-backend.txt .
 RUN pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu \
-    && pip install --no-cache-dir -r requirements.txt
+    && pip install --no-cache-dir -r requirements-backend.txt
 
 COPY --chown=app:app . .
 RUN mkdir -p /app/storage && chown app:app /app/storage

@@ -14,7 +14,7 @@ fi
 sudo -u claramed git -C "$APP" pull --ff-only
 
 # Same dependency step as first setup (the venv was created with pip included); satisfied packages are skipped.
-sudo -u claramed /opt/claramed/venv/bin/python -m pip install --quiet -r "$APP/requirements.txt"
+sudo -u claramed /opt/claramed/venv/bin/python -m pip install --quiet -r "$APP/requirements-backend.txt"
 
 systemctl restart claramed-migrate      # re-runs `alembic upgrade head`
 systemctl restart claramed-api claramed-worker claramed-beat

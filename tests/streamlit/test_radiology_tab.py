@@ -5,14 +5,24 @@ import streamlit as st
 from streamlit.testing.v1 import AppTest
 
 
-PAGE = str(Path(__file__).resolve().parents[2] / "streamlit_app" / "pages" / "1_Radiology_AI.py")
-def run(secrets=None, state=None):
+PAGE = str(Path(__file__).resolve().parents[2] / "app.py")
+def new_app(secrets=None, state=None):
     at = AppTest.from_file(PAGE, default_timeout=30)
+    at.secrets["GROQ_API_KEY"] = "test-key-not-real"   # the legacy tabs of the same app read this
     for key, value in (secrets or {}).items():
         at.secrets[key] = value
     for key, value in (state or {}).items():
         at.session_state[key] = value
-    return at.run()
+    return at
+
+
+def run(secrets=None, state=None):
+    return new_app(secrets, state).run()
+
+
+def test_radiology_ai_is_the_first_tab_of_the_one_page():
+    at = run()
+    assert [t.label for t in at.tabs][:2] == ["🩻 Radiology AI", "Symptom Checker"]
 
 
 def test_page_shows_the_uploader_the_disclaimer_and_the_privacy_note():
@@ -20,7 +30,7 @@ def test_page_shows_the_uploader_the_disclaimer_and_the_privacy_note():
     assert not at.exception, [e.message for e in at.exception]
     assert any("not a diagnosis" in w.value.lower() for w in at.warning)
     assert any("separate" in i.value.lower() and "not saved" in i.value.lower() for i in at.info)
-    assert at.get("file_uploader"), "the X-ray uploader is missing"
+    assert at.file_uploader(key="radiology_upload"), "the X-ray uploader is missing"
 
 
 def test_no_back_link_unless_configured():
@@ -48,6 +58,11 @@ MODEL_RESULT = {
 }
 
 
+@pytest.fixture(autouse=True)
+def scratch_cwd(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)                      # the legacy tabs create their SQLite file in the working directory
+
+
 @pytest.fixture
 def fake_model(monkeypatch):
     created = []
@@ -69,10 +84,10 @@ def fake_model(monkeypatch):
 
 
 def upload_and_analyze(filename, content):
-    at = AppTest.from_file(PAGE, default_timeout=30).run()
-    at.file_uploader[0].upload(filename, content, "image/png")
+    at = new_app().run()
+    at.file_uploader(key="radiology_upload").upload(filename, content, "image/png")
     at.run()
-    at.button[0].click().run()
+    at.button(key="radiology_analyze").click().run()
     return at
 
 
@@ -88,8 +103,8 @@ def test_uploading_and_analyzing_shows_ranked_results(fake_model):
 
 def test_the_model_is_loaded_once_and_reused_across_analyses(fake_model):
     at = upload_and_analyze("xray.png", PNG)
-    at.button[0].click().run()                     # analyse again in the same session
-    AppTest.from_file(PAGE, default_timeout=30).run()
+    at.button(key="radiology_analyze").click().run()   # analyse again in the same session
+    new_app().run()                                    # and a brand-new session
     assert len(fake_model) == 1
 
 
@@ -104,6 +119,6 @@ def test_a_file_that_is_not_an_image_gets_a_generic_error_and_never_reaches_the_
 def test_removing_the_upload_clears_the_results(fake_model):
     at = upload_and_analyze("xray.png", PNG)
     assert at.metric
-    at.file_uploader[0].clear()
+    at.file_uploader(key="radiology_upload").clear()
     at.run()
     assert not at.metric and not at.dataframe

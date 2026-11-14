@@ -130,19 +130,19 @@ streamlit run app_new.py --server.port=8501 --server.address=0.0.0.0
 ### Render.com
 
 **Backend (Web Service):**
-- Build Command: `pip install -r requirements.txt`
+- Build Command: `pip install -r requirements-backend.txt`
 - Start Command: `alembic upgrade head && uvicorn backend.main:app --host 0.0.0.0 --port $PORT`
 - Add PostgreSQL database
 - Add Redis instance
 - Set environment variables
 
 **Worker (Background Worker):**
-- Build Command: `pip install -r requirements.txt`
+- Build Command: `pip install -r requirements-backend.txt`
 - Start Command: `celery -A backend.workers.celery_app worker --loglevel=info`
 - Use same database and Redis
 
 **Frontend (Web Service):**
-- Build Command: `pip install -r requirements.txt`
+- Build Command: `pip install -r requirements-backend.txt`
 - Start Command: `streamlit run app_new.py --server.port=$PORT --server.address=0.0.0.0`
 
 ### Railway

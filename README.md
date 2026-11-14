@@ -110,7 +110,7 @@ docker-compose up -d
 
 1. **Install dependencies:**
 ```bash
-pip install -r requirements.txt
+pip install -r requirements-backend.txt   # API + worker; the Streamlit app alone needs only requirements.txt
 ```
 
 2. **Install Tesseract OCR:**

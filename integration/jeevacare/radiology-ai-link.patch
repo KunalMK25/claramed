@@ -78,7 +78,7 @@ index c50e260..815cf24 100644
                      : 'text-gray-300 hover:bg-white/10 hover:text-white'
 diff --git a/client/src/components/Sidebar.test.jsx b/client/src/components/Sidebar.test.jsx
 new file mode 100644
-index 0000000..7d44f44
+index 0000000..cd0e758
 --- /dev/null
 +++ b/client/src/components/Sidebar.test.jsx
 @@ -0,0 +1,49 @@
@@ -110,7 +110,7 @@ index 0000000..7d44f44
 +    vi.stubEnv('VITE_CLARAMED_BASE_URL', BASE);
 +    const html = render(role);
 +    expect(html).toContain('Radiology AI');
-+    expect(html).toContain(`href="${BASE}/Radiology_AI"`);
++    expect(html).toContain(`href="${BASE}"`);
 +    expect(html).toContain('target="_blank"');
 +    expect(html).toContain('rel="noopener noreferrer"');
 +  });
@@ -132,7 +132,7 @@ index 0000000..7d44f44
 +  });
 +});
 diff --git a/client/src/config/claramed.js b/client/src/config/claramed.js
-index cd2fe77..5acf095 100644
+index cd2fe77..8aaf335 100644
 --- a/client/src/config/claramed.js
 +++ b/client/src/config/claramed.js
 @@ -22,17 +22,33 @@ export const claraMedConfig = {
@@ -143,7 +143,7 @@ index cd2fe77..5acf095 100644
 -   * @param {string} radiologyId - JeevaCare radiology record ID
 -   * @param {string} patientId - JeevaCare patient ID
 -   * @returns {string} Full ClaraMed analysis URL
-+   * URL of ClaraMed's "Radiology AI" page, or null when ClaraMed is not configured.
++   * Address of the ClaraMed website (its first tab is Radiology AI), or null when ClaraMed is not configured.
 +   * ClaraMed is a separate website; this is a plain link, so nothing about the user or a record is sent.
 +   * Read at call time (not cached) so tests and runtime config changes take effect.
 +   * Only https is accepted (http is allowed for localhost during development).
@@ -164,7 +164,7 @@ index cd2fe77..5acf095 100644
 -    return `${this.baseUrl}/analyze?record=${radiologyId}&patient=${patientId}`;
 +    const isLocalhost = parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1';
 +    if (parsed.protocol !== 'https:' && !(parsed.protocol === 'http:' && isLocalhost)) return null;
-+    return `${base}/Radiology_AI`;
++    return base;
 +  },
 +
 +  /**
@@ -179,7 +179,7 @@ index cd2fe77..5acf095 100644
    /**
 diff --git a/client/src/config/claramed.test.js b/client/src/config/claramed.test.js
 new file mode 100644
-index 0000000..4b3ebd2
+index 0000000..ed98b77
 --- /dev/null
 +++ b/client/src/config/claramed.test.js
 @@ -0,0 +1,41 @@
@@ -189,14 +189,14 @@ index 0000000..4b3ebd2
 +afterEach(() => vi.unstubAllEnvs());
 +
 +describe('claraMedConfig.getRadiologyAiUrl', () => {
-+  it('builds the page URL from the base URL', () => {
++  it('is just the ClaraMed address, with no extra path', () => {
 +    vi.stubEnv('VITE_CLARAMED_BASE_URL', 'https://claramed.streamlit.app');
-+    expect(claraMedConfig.getRadiologyAiUrl()).toBe('https://claramed.streamlit.app/Radiology_AI');
++    expect(claraMedConfig.getRadiologyAiUrl()).toBe('https://claramed.streamlit.app');
 +  });
 +
 +  it('strips trailing slashes', () => {
 +    vi.stubEnv('VITE_CLARAMED_BASE_URL', 'https://claramed.streamlit.app//');
-+    expect(claraMedConfig.getRadiologyAiUrl()).toBe('https://claramed.streamlit.app/Radiology_AI');
++    expect(claraMedConfig.getRadiologyAiUrl()).toBe('https://claramed.streamlit.app');
 +  });
 +
 +  it('is null when the variable is unset or blank', () => {
@@ -214,13 +214,13 @@ index 0000000..4b3ebd2
 +    vi.stubEnv('VITE_CLARAMED_BASE_URL', 'not a url');
 +    expect(claraMedConfig.getRadiologyAiUrl()).toBeNull();
 +    vi.stubEnv('VITE_CLARAMED_BASE_URL', 'http://localhost:8501');
-+    expect(claraMedConfig.getRadiologyAiUrl()).toBe('http://localhost:8501/Radiology_AI');
++    expect(claraMedConfig.getRadiologyAiUrl()).toBe('http://localhost:8501');
 +  });
 +
 +  it('getAnalysisUrl sends no patient or record ids', () => {
 +    vi.stubEnv('VITE_CLARAMED_BASE_URL', 'https://claramed.streamlit.app');
 +    const url = claraMedConfig.getAnalysisUrl('rad-123', 'patient-456');
-+    expect(url).toBe('https://claramed.streamlit.app/Radiology_AI');
++    expect(url).toBe('https://claramed.streamlit.app');
 +    expect(url).not.toMatch(/rad-123|patient-456/);
 +  });
 +});
