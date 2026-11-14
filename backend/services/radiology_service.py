@@ -163,39 +163,26 @@ class RadiologyService:
             Preprocessed tensor ready for model
         """
         try:
-            # Load image
-            image = Image.open(image_path)
+            import torchxrayvision as xrv
+
+            with Image.open(image_path) as image:
+                img_array = np.array(image.convert("L"), dtype=np.float32)
             
-            # Convert to RGB if necessary
-            if image.mode != 'RGB':
-                image = image.convert('RGB')
+            # TorchXRayVision expects pixels scaled to [-1024, 1024] ...
+            img_array = xrv.datasets.normalize(img_array, 255)
+            img_array = img_array[None, ...]  # [1, H, W]
             
-            # Convert to numpy array
-            img_array = np.array(image)
-            
-            # Convert to grayscale (chest X-rays are grayscale)
-            if len(img_array.shape) == 3:
-                # Simple averaging for RGB to grayscale
-                img_array = np.mean(img_array, axis=2)
-            
-            # Normalize to [0, 1]
-            img_array = img_array.astype(np.float32) / 255.0
-            
-            # Resize to model input size (224x224 for densenet121-res224)
-            # TorchXRayVision expects specific size
+            # ... center-cropped to a square (keeps the aspect ratio) and resized
+            # to the model's native resolution.
             target_size = 224 if "224" in self.model_name else 512
-            
-            img_pil = Image.fromarray((img_array * 255).astype(np.uint8))
-            img_pil = img_pil.resize((target_size, target_size), Image.BILINEAR)
-            img_array = np.array(img_pil) / 255.0
-            
-            # Normalize using TorchXRayVision's expected normalization
-            # These models expect zero-centered data
-            img_array = (img_array - 0.5) / 0.5
+            transform = transforms.Compose([
+                xrv.datasets.XRayCenterCrop(),
+                xrv.datasets.XRayResizer(target_size),
+            ])
+            img_array = transform(img_array)
             
             # Convert to tensor: [1, 1, H, W]
-            img_tensor = torch.from_numpy(img_array).float()
-            img_tensor = img_tensor.unsqueeze(0).unsqueeze(0)
+            img_tensor = torch.from_numpy(img_array).float().unsqueeze(0)
             
             logger.info(f"Image preprocessed: shape {img_tensor.shape}")
             return img_tensor

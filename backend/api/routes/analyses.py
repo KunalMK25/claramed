@@ -3,7 +3,7 @@ Medical Analysis API Routes
 
 Handles symptom analysis, document processing, and radiology inference.
 """
-from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
+from fastapi import APIRouter, Depends, Form, HTTPException, status, UploadFile, File
 from sqlalchemy.orm import Session
 from typing import List, Optional
 from uuid import UUID
@@ -15,7 +15,6 @@ from backend.api.dependencies import require_authentication, check_analysis_acce
 from backend.models.analysis import MedicalAnalysis, AnalysisStatus, AnalysisType
 from backend.models.result import AnalysisResult, ResultType
 from backend.models.document import UploadedDocument, DocumentType
-from backend.models.radiology import RadiologyFinding
 from backend.models.integration_client import IntegrationClient
 from backend.schemas.analysis import (
     SymptomAnalysisRequest,
@@ -29,7 +28,8 @@ from backend.services.symptom_service import SymptomService
 from backend.services.emergency_service import EmergencyService
 from backend.services.document_service import DocumentService
 from backend.services.ocr_service import OCRService
-from backend.services.radiology_service import RadiologyService
+from backend.services.radiology_report import BODY_PARTS, build_report, save_report
+from backend.services.image_loader import SUPPORTED_EXTENSIONS
 from backend.services.storage_service import StorageService
 from backend.core.logging import get_logger
 from backend.core.exceptions import ValidationError, ProcessingError
@@ -38,6 +38,15 @@ from datetime import datetime
 logger = get_logger(__name__)
 
 router = APIRouter()
+
+# Upload extension -> stored document type (PDF/DICOM have no image-specific type)
+DOCUMENT_TYPES = {
+    ".png": DocumentType.IMAGE_PNG,
+    ".jpg": DocumentType.IMAGE_JPEG,
+    ".jpeg": DocumentType.IMAGE_JPEG,
+    ".pdf": DocumentType.PDF,
+    ".dcm": DocumentType.DICOM,
+}
 
 
 @router.post("/analyses", response_model=SymptomAnalysisResponse, status_code=status.HTTP_201_CREATED)
@@ -509,13 +518,18 @@ async def upload_document(
 async def upload_radiology_image(
     analysis_id: str,
     file: UploadFile = File(...),
+    body_part: str = Form("chest"),
     db: Session = Depends(get_db),
     client: IntegrationClient = Depends(require_authentication),
 ):
     """
-    Upload a chest X-ray image for radiology AI analysis.
-    
-    Supports PNG, JPEG, JPG formats. Performs TorchXRayVision inference.
+    Upload an X-ray for AI analysis with a plain-English explanation.
+
+    Accepts PNG, JPG, DICOM and PDF (first page). ``body_part="chest"`` (default)
+    runs the chest X-ray model; ``"other"`` sends the image to a vision LLM for a
+    general description of non-chest X-rays (the image is sent to Groq).
+    The explanation covers an overall verdict, what was flagged, what looks
+    normal, next steps and questions to ask a doctor.
     """
     try:
         analysis_uuid = UUID(analysis_id)
@@ -543,29 +557,33 @@ async def upload_radiology_image(
         )
     
     # Validate file type
-    valid_extensions = ['.png', '.jpg', '.jpeg']
-    if not any(file.filename.lower().endswith(ext) for ext in valid_extensions):
+    suffix = Path(file.filename or "").suffix.lower()
+    if suffix not in SUPPORTED_EXTENSIONS:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Supported formats: {', '.join(valid_extensions)}"
+            detail=f"Supported formats: {', '.join(sorted(SUPPORTED_EXTENSIONS))}"
         )
     
+    body_part = body_part.lower()
+    if body_part not in BODY_PARTS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"body_part must be one of: {', '.join(BODY_PARTS)}"
+        )
+    
+    tmp_path = None
     try:
         # Save uploaded file temporarily
-        suffix = Path(file.filename).suffix
+        content = await file.read()
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_file:
-            content = await file.read()
             tmp_file.write(content)
             tmp_path = Path(tmp_file.name)
         
-        # Initialize services
-        radiology_service = RadiologyService()
+        # Analyze and explain (converts PDF/DICOM, runs model, writes plain English)
+        report = build_report(tmp_path, body_part=body_part, language=analysis.language)
+        
+        # Store the original upload
         storage_service = StorageService()
-        
-        # Perform radiology analysis
-        analysis_result = radiology_service.analyze_chest_xray(tmp_path)
-        
-        # Store image
         storage_key = storage_service.generate_storage_key(
             analysis_id=str(analysis.id),
             filename=file.filename,
@@ -573,20 +591,11 @@ async def upload_radiology_image(
         )
         storage_result = storage_service.save_file(tmp_path, storage_key)
         
-        # Determine document type
-        if suffix.lower() == '.png':
-            doc_type = DocumentType.IMAGE_PNG
-        elif suffix.lower() in ['.jpg', '.jpeg']:
-            doc_type = DocumentType.IMAGE_JPEG
-        else:
-            doc_type = DocumentType.IMAGE_PNG
-        
-        # Create document record
         document = UploadedDocument(
             analysis_id=analysis.id,
             filename=storage_key.split('/')[-1],
             original_filename=file.filename,
-            file_type=doc_type,
+            file_type=DOCUMENT_TYPES[suffix],
             file_size=len(content),
             checksum=storage_service.generate_storage_key(str(analysis.id), file.filename)[:64],
             storage_key=storage_key,
@@ -594,52 +603,21 @@ async def upload_radiology_image(
         )
         db.add(document)
         
-        # Save findings
-        for finding_data in analysis_result["findings"]:
-            finding = RadiologyFinding(
-                analysis_id=analysis.id,
-                finding_label=finding_data["label"],
-                model_score=finding_data["model_score"],
-                model_name=analysis_result["model_name"],
-                model_version=analysis_result.get("model_version", "pretrained"),
-                modality=analysis_result["modality"],
-            )
-            db.add(finding)
-        
-        # Save inference result
-        inference_result = AnalysisResult(
-            analysis_id=analysis.id,
-            result_type=ResultType.RADIOLOGY_INFERENCE,
-            content={
-                "modality": analysis_result["modality"],
-                "model_name": analysis_result["model_name"],
-                "findings": analysis_result["findings"],
-                "disclaimer": analysis_result["disclaimer"],
-            },
-            model_name=analysis_result["model_name"],
-        )
-        db.add(inference_result)
-        
-        # Update analysis
-        analysis.analysis_type = AnalysisType.XRAY
-        analysis.status = AnalysisStatus.COMPLETED
-        analysis.processing_completed_at = datetime.utcnow()
-        analysis.processing_duration_seconds = str(analysis_result["processing_duration_seconds"])
-        
+        save_report(db, analysis, report)
         db.commit()
-        
-        # Clean up temp file
-        tmp_path.unlink()
         
         logger.info(f"Radiology image processed: {document.id}")
         
         return {
             "document_id": str(document.id),
             "analysis_id": str(analysis.id),
-            "modality": analysis_result["modality"],
-            "model_name": analysis_result["model_name"],
-            "num_findings": len(analysis_result["findings"]),
-            "top_findings": analysis_result["findings"][:5],
+            "modality": report["modality"],
+            "model_name": report["model_name"],
+            "overall": (report.get("summary") or {}).get("overall"),
+            "explanation": report["explanation"],
+            "generated_by": report["generated_by"],
+            "num_findings": len(report["findings"]),
+            "top_findings": report["findings"][:5],
         }
     
     except ValidationError as e:
@@ -652,3 +630,6 @@ async def upload_radiology_image(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Radiology analysis failed"
         )
+    finally:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)

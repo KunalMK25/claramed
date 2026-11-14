@@ -11,7 +11,7 @@ from backend.models.analysis import MedicalAnalysis, AnalysisStatus, AnalysisTyp
 from backend.models.result import AnalysisResult, ResultType
 from backend.services.document_service import DocumentService
 from backend.services.ocr_service import OCRService
-from backend.services.radiology_service import RadiologyService
+from backend.services.radiology_report import build_report, save_report
 from backend.services.storage_service import StorageService
 from backend.core.exceptions import CorruptDocumentError, ValidationError
 from pathlib import Path
@@ -215,7 +215,6 @@ def process_radiology_async(self, analysis_id: str, image_id: str):
             
             # Get image document
             from backend.models.document import UploadedDocument
-            from backend.models.radiology import RadiologyFinding
             
             image = db.query(UploadedDocument).filter(
                 UploadedDocument.id == UUID(image_id)
@@ -229,52 +228,17 @@ def process_radiology_async(self, analysis_id: str, image_id: str):
             analysis.processing_started_at = datetime.utcnow()
             db.commit()
             
-            # Initialize services
-            storage_service = StorageService()
-            radiology_service = RadiologyService()
-            
             # Retrieve image from storage
+            storage_service = StorageService()
             temp_path = storage_service.get_file(image.storage_key)
             
             try:
-                # Perform radiology analysis
+                # Analyze and explain in plain English, then save everything
                 try:
-                    analysis_result = radiology_service.analyze_chest_xray(temp_path)
+                    report = build_report(temp_path, language=analysis.language)
                 except ValidationError as exc:
                     raise NonRetryableError(str(exc)) from exc
-                
-                # Save findings
-                for finding_data in analysis_result["findings"]:
-                    finding = RadiologyFinding(
-                        analysis_id=analysis.id,
-                        finding_label=finding_data["label"],
-                        model_score=finding_data["model_score"],
-                        model_name=analysis_result["model_name"],
-                        model_version=analysis_result.get("model_version", "pretrained"),
-                        modality=analysis_result["modality"],
-                    )
-                    db.add(finding)
-                
-                # Save inference result
-                inference_result = AnalysisResult(
-                    analysis_id=analysis.id,
-                    result_type=ResultType.RADIOLOGY_INFERENCE,
-                    content={
-                        "modality": analysis_result["modality"],
-                        "model_name": analysis_result["model_name"],
-                        "findings": analysis_result["findings"],
-                        "disclaimer": analysis_result["disclaimer"],
-                    },
-                    model_name=analysis_result["model_name"],
-                )
-                db.add(inference_result)
-                
-                # Update analysis
-                analysis.analysis_type = AnalysisType.XRAY
-                analysis.status = AnalysisStatus.COMPLETED
-                analysis.processing_completed_at = datetime.utcnow()
-                analysis.processing_duration_seconds = str(analysis_result["processing_duration_seconds"])
-                
+                save_report(db, analysis, report)
                 db.commit()
                 
                 logger.info(f"Radiology image processed successfully: {image_id}")
