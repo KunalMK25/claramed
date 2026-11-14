@@ -40,18 +40,59 @@ def test_score_above_default_threshold_is_flagged_with_plain_description():
 
 
 def test_per_finding_threshold_overrides_default():
-    findings = [{"label": "Nodule", "model_score": 0.4, "threshold": 0.3}]
+    findings = [{"label": "Nodule", "model_score": 0.6, "threshold": 0.3}]
     assert [f["label"] for f in build_summary(findings)["flagged"]] == ["Nodule"]
-    findings = [{"label": "Nodule", "model_score": 0.4, "threshold": 0.8}]
+    findings = [{"label": "Nodule", "model_score": 0.6, "threshold": 0.8}]
     assert build_summary(findings)["flagged"] == []
 
 
 def test_levels_increase_with_score():
     levels = [
         build_summary(_findings(Mass=s))["flagged"][0]["level"]
-        for s in (0.55, 0.7, 0.97)
+        for s in (0.65, 0.8, 0.97)
     ]
     assert levels == ["low", "moderate", "high"]
+
+
+# ---- borderline: scores barely over the threshold are not real flags ------
+
+def test_scores_barely_over_threshold_are_borderline_not_flagged():
+    summary = build_summary(_findings(Fibrosis=0.5, Pleural_Thickening=0.52, Mass=0.1))
+    assert summary["flagged"] == []
+    assert [b["label"] for b in summary["borderline"]] == ["Pleural_Thickening", "Fibrosis"]
+    assert summary["overall"] == "borderline"
+    assert summary["urgent"] is False
+
+
+def test_borderline_items_are_not_listed_as_normal():
+    summary = build_summary(_findings(Fibrosis=0.5, Mass=0.1))
+    assert all("scarring" not in n for n in summary["not_flagged"])
+
+
+def test_real_flags_win_over_borderline_in_the_verdict():
+    summary = build_summary(_findings(Fibrosis=0.5, Fracture=0.95))
+    assert summary["overall"] == "attention"
+    assert [f["label"] for f in summary["flagged"]] == ["Fracture"]
+    assert [b["label"] for b in summary["borderline"]] == ["Fibrosis"]
+
+
+def test_healthy_scan_has_empty_borderline_list():
+    assert build_summary(HEALTHY)["borderline"] == []
+
+
+def test_borderline_template_is_gentle_and_does_not_claim_no_issues():
+    text = render_template_explanation(build_summary(_findings(Fibrosis=0.5))).lower()
+    assert "no issues" not in text
+    assert "faint" in text and "lung scarring" in text
+    assert "mention" in text and "doctor" in text
+    assert "0.5" not in text
+
+
+def test_borderline_items_are_given_to_the_llm_as_uncertain():
+    chain = _FakeChain(reply="ok")
+    explain_chest_findings(_findings(Fibrosis=0.5), language="English", chain=chain)
+    text = chain.calls[0]["summary_text"].lower()
+    assert "borderline" in text and "lung scarring" in text
 
 
 def test_flagged_sorted_strongest_first():

@@ -78,6 +78,7 @@ def fake_model(monkeypatch):
             return MODEL_RESULT
 
     monkeypatch.setattr("backend.services.radiology_service.RadiologyService", FakeRadiologyService)
+    monkeypatch.setattr("backend.services.radiology_explainer.get_explanation_chain", lambda: None)  # no live LLM
     st.cache_resource.clear()                     # the page caches the model per process; keep tests independent
     yield created
     st.cache_resource.clear()
@@ -109,9 +110,9 @@ def test_the_model_is_loaded_once_and_reused_across_analyses(fake_model):
 
 
 def test_a_file_that_is_not_an_image_gets_a_generic_error_and_never_reaches_the_model(fake_model):
-    at = upload_and_analyze("report.png", b"%PDF-1.4 definitely not an image")
+    at = upload_and_analyze("report.png", b"<html>definitely not an image</html>")
     assert not at.exception, [e.message for e in at.exception]
-    assert [e.value for e in at.error] == ["This does not look like a PNG or JPEG image."]
+    assert [e.value for e in at.error] == ["This does not look like a PNG, JPEG, DICOM or PDF file."]
     assert not at.metric and not at.dataframe
     assert fake_model == []                        # validation failed before the model was even loaded
 
@@ -122,3 +123,17 @@ def test_removing_the_upload_clears_the_results(fake_model):
     at.file_uploader(key="radiology_upload").clear()
     at.run()
     assert not at.metric and not at.dataframe
+
+
+def test_results_lead_with_a_plain_english_explanation(fake_model):
+    at = upload_and_analyze("xray.png", PNG)
+    text = " ".join(m.value for m in at.markdown).lower()
+    assert "what your x-ray shows" in text
+    assert "collapsed lung" in text                    # the flagged finding, in everyday words
+    assert "next steps" in text and "questions to ask your doctor" in text
+
+
+def test_the_uploader_accepts_pdf_and_dicom_and_the_page_offers_a_body_part_choice():
+    at = new_app().run()
+    assert at.radio(key="radiology_body_part").value == "chest"
+    assert at.file_uploader(key="radiology_upload").proto.type == [".png", ".jpg", ".jpeg", ".pdf", ".dcm"]

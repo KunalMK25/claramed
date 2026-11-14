@@ -4,7 +4,7 @@ Patient-friendly explanation of chest X-ray AI findings.
 The model only produces per-condition scores. This module turns them into a
 structured, plain-English report:
 
-* an overall verdict (no concerns / needs attention / inconclusive),
+* an overall verdict (no concerns / borderline / needs attention / inconclusive),
 * each flagged finding explained in everyday words with a low/moderate/high level,
 * what looked normal,
 * next steps and questions to ask a doctor.
@@ -87,9 +87,11 @@ def _valid_threshold(value: Any) -> float:
 
 
 def _level(score: float, threshold: float) -> str:
-    """How far above its threshold the score is: low / moderate / high."""
+    """How far above its threshold the score is: borderline / low / moderate / high."""
     strength = (score - threshold) / (1 - threshold)
-    if strength < 0.25:
+    if strength < 0.15:
+        return "borderline"  # barely over the line: too uncertain to call a finding
+    if strength < 0.35:
         return "low"
     if strength < 0.7:
         return "moderate"
@@ -99,9 +101,11 @@ def _level(score: float, threshold: float) -> str:
 def build_summary(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Turn raw model scores into a structured, patient-oriented summary."""
     if not findings:
-        return {"overall": "inconclusive", "flagged": [], "not_flagged": [], "urgent": False}
+        return {"overall": "inconclusive", "flagged": [], "borderline": [], "not_flagged": [],
+                "urgent": False}
 
     flagged: List[Dict[str, Any]] = []
+    borderline: List[Dict[str, Any]] = []
     not_flagged: List[str] = []
     for f in findings:
         label = f.get("label", "Unknown")
@@ -112,27 +116,30 @@ def build_summary(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
             (label.replace("_", " "), "The AI noticed a pattern it associates with this condition."),
         )
         if score >= threshold:
-            flagged.append({
+            level = _level(score, threshold)
+            (borderline if level == "borderline" else flagged).append({
                 "label": label,
                 "plain_name": plain_name,
                 "what_it_is": what_it_is,
-                "level": _level(score, threshold),
+                "level": level,
                 "_score": score,
             })
         else:
             not_flagged.append(plain_name)
 
-    flagged.sort(key=lambda x: x["_score"], reverse=True)
-    for item in flagged:
-        del item["_score"]  # raw scores are model internals, not patient-facing
+    for group in (flagged, borderline):
+        group.sort(key=lambda x: x["_score"], reverse=True)
+        for item in group:
+            del item["_score"]  # raw scores are model internals, not patient-facing
 
     urgent = any(
         _key(i["label"]) in _URGENT_LABELS and i["level"] in ("moderate", "high")
         for i in flagged
     )
     return {
-        "overall": "attention" if flagged else "no_concerns",
+        "overall": "attention" if flagged else "borderline" if borderline else "no_concerns",
         "flagged": flagged,
+        "borderline": borderline,
         "not_flagged": not_flagged,
         "urgent": urgent,
     }
@@ -153,6 +160,15 @@ def render_template_explanation(summary: Dict[str, Any]) -> str:
             "**Good news: no issues were flagged.** The AI checked this chest X-ray for "
             "common problems and nothing concerning stood out.",
         ]
+    elif overall == "borderline":
+        lines += [
+            "**Nothing clearly concerning was found**, but the AI noticed a few faint, uncertain "
+            "signs. These are often nothing, and the AI cannot tell for sure. A doctor can.",
+            "",
+            "## Faint signs the AI was unsure about",
+            "",
+        ]
+        lines += [f"- **{i['plain_name'].capitalize()}**: {i['what_it_is']}" for i in summary["borderline"]]
     else:
         n = len(summary["flagged"])
         lines += [
@@ -176,12 +192,24 @@ def render_template_explanation(summary: Dict[str, Any]) -> str:
         lines += ["", "## What looks normal", "",
                   "The AI did not flag: " + ", ".join(summary["not_flagged"]) + "."]
 
+    if summary.get("borderline") and overall == "attention":
+        lines += ["", "## Faint signs the AI was unsure about", "",
+                  "The AI also noticed faint, uncertain signs of: "
+                  + ", ".join(i["plain_name"] for i in summary["borderline"]) + ". Mention these to your doctor."]
+
     lines += ["", "## Next steps", ""]
     if overall == "no_concerns":
         lines += [
             "- Keep this result for your records.",
             "- A clear AI result does not rule out every problem. If you feel unwell, "
             "see a doctor anyway.",
+        ]
+    elif overall == "borderline":
+        lines += [
+            "- Mention the faint signs above to your doctor when you next see them. There is "
+            "usually no need to worry.",
+            "- A clear AI result does not rule out every problem. If you feel unwell, see a doctor "
+            "anyway.",
         ]
     else:
         lines += [
@@ -207,6 +235,10 @@ def _summary_for_prompt(summary: Dict[str, Any]) -> str:
             lines.append(f"- {i['plain_name']} [{i['level']} level]: {i['what_it_is']}")
     else:
         lines.append("Flagged findings: none")
+    if summary.get("borderline"):
+        lines.append("Borderline, faint and uncertain signs (not real findings; mention gently, never alarm):")
+        for i in summary["borderline"]:
+            lines.append(f"- {i['plain_name']}: {i['what_it_is']}")
     if summary["not_flagged"]:
         lines.append("Checked and not flagged: " + ", ".join(summary["not_flagged"]))
     return "\n".join(lines)

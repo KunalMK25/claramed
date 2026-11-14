@@ -90,13 +90,16 @@ You are given a verified summary of what the AI found. Base everything strictly 
 
 {summary_text}
 
-Write a clear explanation in simple everyday words and short sentences, in {language}. Avoid jargon; if you must use a medical term, explain it. Use exactly these Markdown sections:
+Write a clear explanation in simple everyday words and short sentences, in {language}. Avoid jargon; if you must use a medical term, explain it. Use exactly these Markdown sections (leave out any that the rules say to omit):
 
 ## What your X-ray shows
-Start with a one or two sentence overall verdict. If the overall result is "no_concerns", clearly say that no issues were flagged and everything the AI checked looks normal. If it is "inconclusive", say the result could not be read and do not claim the X-ray is healthy.
+Start with a one or two sentence overall verdict. If the overall result is "no_concerns", clearly say that no issues were flagged and everything the AI checked looks normal. If it is "borderline", say nothing clearly concerning was found but there are a few faint, uncertain signs worth mentioning to a doctor, and do not alarm the patient. If it is "inconclusive", say the result could not be read and do not claim the X-ray is healthy.
 
 ## What was flagged
 Only if there are flagged findings: for each one, say what it is in everyday words, what it can mean, and how strongly the AI flagged it (low, moderate or high level of concern). Remind the patient a flag is not a diagnosis. Write "Nothing was flagged." if there are none.
+
+## Faint signs the AI was unsure about
+Only if the summary lists borderline signs: mention them gently as uncertain, usually harmless, and worth raising with a doctor. Leave this section out otherwise.
 
 ## What looks normal
 Briefly list the conditions that were checked and not flagged.

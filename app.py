@@ -447,7 +447,7 @@ st.markdown("""
 tab_radiology, tab1, tab2, tab3 = st.tabs(["🩻 Radiology AI", "Symptom Checker", "Report Explainer", "📊 Symptom History"])
 
 with tab_radiology:
-    render_radiology_tab()
+    render_radiology_tab(selected_lang)
 
 # Tab 1: Symptom Checker
 with tab1:

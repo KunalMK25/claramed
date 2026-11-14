@@ -1,12 +1,16 @@
-"""Validate an uploaded chest X-ray and run the radiology model on it. No Streamlit imports."""
+"""Validate an uploaded X-ray (PNG, JPEG, DICOM or PDF), analyse it and explain it in plain English. No Streamlit imports."""
 import logging
 import tempfile
+import time
+from typing import Optional
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 from backend.core.config import settings
 from backend.core.exceptions import ValidationError
+from backend.services.image_loader import prepare_image
+from backend.services.radiology_explainer import DISCLAIMER, explain_chest_findings
 from backend.services.url_fetcher import FetchError, detect_file
 
 logger = logging.getLogger(__name__)
@@ -32,49 +36,97 @@ class Finding:
 
 @dataclass
 class RadiologyOutcome:
-    findings: list[Finding]          # every finding, highest score first
+    findings: list[Finding]          # every finding, highest score first (empty for non-chest X-rays)
     disclaimer: str
     model_name: str
     seconds: float
+    explanation: str = ""            # plain-English Markdown report: this is what the patient reads
+    summary: Optional[dict] = None   # structured verdict behind the explanation (chest only)
+    generated_by: str = "template"   # "llm" | "template" | "vision_llm" | "unavailable"
 
     def top(self, n: int = 3) -> list[Finding]:
         return self.findings[:n]
 
 
-def analyze_upload(data: bytes, get_service: Callable[[], object]) -> RadiologyOutcome:
-    """
-    Validate `data` as a PNG/JPEG and analyse it. The bytes touch disk only in one temp file, always removed.
+BODY_PARTS = ("chest", "other")
 
-    `get_service` returns an object with `analyze_chest_xray(path) -> dict`. It is called only AFTER the upload
-    passed validation, because loading the model is expensive and a bad file should never trigger it.
+
+def _detect_extension(data: bytes) -> str:
+    """File extension by content, never by file name. Raises FetchError for anything unsupported."""
+    try:
+        _, extension = detect_file(data, "radiology")
+        return extension
+    except FetchError:
+        if data.startswith(b"%PDF-"):
+            return ".pdf"
+        if data[128:132] == b"DICM":
+            return ".dcm"
+        raise
+
+
+def _default_vision(path: Path, language: str) -> dict:
+    from backend.services.xray_vision import explain_other_xray
+
+    return explain_other_xray(path, language)
+
+
+def analyze_upload(
+    data: bytes,
+    get_service: Callable[[], object],
+    language: str = "English",
+    body_part: str = "chest",
+    chain_factory: Optional[Callable[[], object]] = None,
+    vision: Callable[[Path, str], dict] = _default_vision,
+) -> RadiologyOutcome:
     """
+    Validate `data` as a PNG/JPEG/DICOM/PDF X-ray, analyse it and explain the result in plain English.
+    The bytes touch disk only in temp files, always removed.
+
+    `body_part="chest"` runs the chest model from `get_service()` (an object with
+    `analyze_chest_xray(path) -> dict`); `"other"` asks the vision LLM instead (the image leaves the server).
+    The service is only requested AFTER the upload passed validation, because loading the model is
+    expensive and a bad file should never trigger it. `chain_factory` builds the LLM that words the
+    explanation; without it, or if it fails, a built-in template is used.
+    """
+    if body_part not in BODY_PARTS:
+        raise UploadError("bad_body_part", "Choose either a chest X-ray or another body part.")
     if not data:
         raise UploadError("empty", "The file is empty.")
     if len(data) > MAX_UPLOAD_BYTES:
         raise UploadError("too_large", f"The file is larger than {settings.MAX_UPLOAD_SIZE_MB} MB.")
     try:
-        _, extension = detect_file(data, "radiology")           # by content, never by file name
+        extension = _detect_extension(data)
     except FetchError:
-        raise UploadError("not_an_image", "This does not look like a PNG or JPEG image.") from None
+        raise UploadError("not_an_image", "This does not look like a PNG, JPEG, DICOM or PDF file.") from None
 
-    path = None
+    path = image = None
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=extension) as tmp:
             tmp.write(data)
             path = Path(tmp.name)
-        result = get_service().analyze_chest_xray(path)
+        image = prepare_image(path)                              # PDF / DICOM -> PNG; PNG / JPEG unchanged
+        if body_part == "other":
+            started = time.perf_counter()
+            result = vision(image, language)
+            return RadiologyOutcome([], DISCLAIMER, result["model_name"], time.perf_counter() - started,
+                                    result["explanation"], None, result["generated_by"])
+        result = get_service().analyze_chest_xray(image)
+        explained = explain_chest_findings(
+            result["findings"], language, chain=chain_factory() if chain_factory else None)
     except ValidationError:
-        raise UploadError("invalid_image", "This image could not be read. Try another PNG or JPEG.") from None
+        raise UploadError("invalid_image", "This image could not be read. Try another file.") from None
     except Exception:
         logger.exception("radiology analysis failed")           # server log only; no file name or content
         raise UploadError("analysis_failed", "The analysis failed. Please try again.") from None
     finally:
-        if path is not None:
-            path.unlink(missing_ok=True)
+        for temp in (path, image):
+            if temp is not None:
+                temp.unlink(missing_ok=True)
 
     findings = sorted(
         (Finding(f["label"], float(f["model_score"])) for f in result["findings"]),
         key=lambda f: f.score, reverse=True,
     )
     return RadiologyOutcome(findings, result["disclaimer"], result["model_name"],
-                            float(result["processing_duration_seconds"]))
+                            float(result["processing_duration_seconds"]),
+                            explained["explanation"], explained["summary"], explained["generated_by"])

@@ -1,6 +1,8 @@
+import io
 from pathlib import Path
 
 import pytest
+from PIL import Image
 
 from backend.core.exceptions import ProcessingError, ValidationError
 from streamlit_app.radiology_flow import MAX_UPLOAD_BYTES, UploadError, analyze_upload
@@ -63,7 +65,7 @@ def test_empty_oversize_and_non_image_uploads_are_rejected_without_even_loading_
         return svc
 
     for data, code in [(b"", "empty"), (PNG + b"0" * MAX_UPLOAD_BYTES, "too_large"),
-                       (b"%PDF-1.4 not an image", "not_an_image"), (b"<html>hi</html>", "not_an_image")]:
+                       (b"<html>hi</html>", "not_an_image"), (b"plain text", "not_an_image")]:
         with pytest.raises(UploadError) as e:
             analyze_upload(data, factory)
         assert e.value.code == code
@@ -80,3 +82,76 @@ def test_unexpected_errors_never_leak_details():
     with pytest.raises(UploadError) as e:
         analyze_upload(PNG, lambda: FakeService(error=RuntimeError("patient-ABC.png exploded")))
     assert e.value.code == "analysis_failed" and "patient-ABC" not in e.value.message
+
+
+# --- plain-English explanation, PDF/DICOM uploads and non-chest X-rays ---
+
+def _pdf_bytes():
+    buf = io.BytesIO()
+    Image.new("RGB", (32, 32), "gray").save(buf, "PDF")
+    return buf.getvalue()
+
+
+class FakeChain:
+    def __init__(self, reply="## Summary\nLooks fine."):
+        self.reply, self.calls = reply, []
+
+    def invoke(self, variables):
+        self.calls.append(variables)
+        return self.reply
+
+
+def test_outcome_carries_a_plain_english_explanation_without_an_llm():
+    out = analyze_upload(PNG, lambda: FakeService())
+    assert out.generated_by == "template"
+    assert out.summary["overall"] == "attention"
+    assert "collapsed lung" in out.explanation.lower()
+    assert "0.9" not in out.explanation                 # raw model scores stay out of the explanation
+
+
+def test_llm_chain_is_used_when_a_factory_is_given_with_the_chosen_language():
+    chain = FakeChain()
+    out = analyze_upload(PNG, lambda: FakeService(), language="Hindi", chain_factory=lambda: chain)
+    assert out.generated_by == "llm" and "Looks fine." in out.explanation
+    assert chain.calls[0]["language"] == "Hindi"
+
+
+def test_pdf_upload_is_converted_to_an_image_before_the_model_sees_it():
+    svc = FakeService()
+    analyze_upload(_pdf_bytes(), lambda: svc)
+    assert svc.paths[0].suffix == ".png"
+    assert not svc.paths[0].exists()                    # converted temp image is cleaned up too
+
+
+def test_a_broken_pdf_or_dicom_gets_the_generic_unreadable_message_and_skips_the_model():
+    loads = []
+
+    def factory():
+        loads.append(1)
+        return FakeService()
+
+    for data in (b"%PDF-1.4 truncated", b"\0" * 128 + b"DICM" + b"junk"):
+        with pytest.raises(UploadError) as e:
+            analyze_upload(data, factory)
+        assert e.value.code == "invalid_image"
+    assert loads == []
+
+
+def test_other_body_part_uses_the_vision_explainer_and_never_loads_the_chest_model():
+    loads, seen = [], []
+
+    def vision(path, language):
+        seen.append((path.suffix, language))
+        return {"modality": "xray_other", "summary": None, "model_name": "vision-model",
+                "generated_by": "vision_llm", "explanation": "A hand X-ray."}
+
+    out = analyze_upload(PNG, lambda: loads.append(1), language="Tamil", body_part="other", vision=vision)
+    assert loads == [] and seen == [(".png", "Tamil")]
+    assert out.findings == [] and out.explanation == "A hand X-ray." and out.generated_by == "vision_llm"
+    assert out.model_name == "vision-model"
+
+
+def test_unknown_body_part_is_rejected():
+    with pytest.raises(UploadError) as e:
+        analyze_upload(PNG, lambda: FakeService(), body_part="brain")
+    assert e.value.code == "bad_body_part"
