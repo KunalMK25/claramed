@@ -140,7 +140,7 @@ def _gemini_generate(image_path: Path, system: str, user_text: str, max_tokens: 
         logger.warning(f"Could not list Gemini models: {e}")
         available = []
     global _working_gemini_model
-    last: Optional[Exception] = None
+    attempts = []
     order = _model_order(
         _working_gemini_model,
         [*available[:3], *GEMINI_MODELS, getattr(settings, "GEMINI_VISION_MODEL", None)],
@@ -159,11 +159,12 @@ def _gemini_generate(image_path: Path, system: str, user_text: str, max_tokens: 
             if text:
                 _working_gemini_model = model
                 return text
-            last = ValueError(f"{model} returned no text")
+            attempts.append(f"{model}: no text returned")
         except Exception as e:  # try the next model
             logger.warning(f"Gemini model {model} failed: {e}")
-            last = e
-    raise last or RuntimeError("Gemini returned nothing")
+            attempts.append(f"{model}: {_short_reason(e)}")
+    listed = ", ".join(available[:5]) or "none (model list unavailable)"
+    raise RuntimeError(f"tried {'; '.join(attempts)}. Models Google lists for this key: {listed}")
 
 
 _MODEL_LIST_TTL = 600  # seconds; Google changes its models rarely
@@ -209,6 +210,18 @@ def detect_body_part(image_path: Path, llm: Optional[Any] = None) -> Optional[st
     if word.startswith("other"):
         return "other"
     return None
+
+
+def _short_reason(error: Exception) -> str:
+    """HTTP status plus Google's own message, without the URL."""
+    response = getattr(error, "response", None)
+    if response is not None:
+        try:
+            message = response.json().get("error", {}).get("message", "")
+        except Exception:
+            message = ""
+        return f"HTTP {response.status_code} {message}".strip()[:160]
+    return str(error)[:160]
 
 
 def _model_order(configured: Optional[str], defaults):

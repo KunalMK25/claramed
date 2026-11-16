@@ -24,7 +24,7 @@ MAX_UPLOAD_BYTES = settings.MAX_UPLOAD_SIZE_MB * 1024 * 1024
 _SECRET = re.compile(r"(AIza[0-9A-Za-z_\-]{10,}|gsk_[0-9A-Za-z]{10,}|[Bb]earer\s+\S+)")
 
 
-def _safe_reason(error: Exception, limit: int = 400) -> str:
+def _safe_reason(error: Exception, limit: int = 900) -> str:
     """The provider's own error text, with anything key-shaped removed and cut short."""
     return _SECRET.sub("[hidden]", str(error)).strip()[:limit]
 
