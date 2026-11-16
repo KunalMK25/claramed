@@ -57,7 +57,7 @@ def render_radiology_tab(language: str = "English") -> None:
     st.info("ClaraMed is a separate service from JeevaCare. Your image is not saved and is never sent to JeevaCare. "
             "Chest X-rays are analysed in memory; only a short text summary of the findings (never the image) goes "
             "to the AI service that words the explanation. If you choose \"Other body part\", the image itself is "
-            "sent to that AI service (Groq).")
+            "sent to that AI service (Gemini or Groq).")
 
     back = jeevacare_url()
     if back:

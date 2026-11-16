@@ -155,3 +155,11 @@ def test_unknown_body_part_is_rejected():
     with pytest.raises(UploadError) as e:
         analyze_upload(PNG, lambda: FakeService(), body_part="brain")
     assert e.value.code == "bad_body_part"
+
+
+def test_provider_reason_is_shown_without_any_key():
+    from streamlit_app.radiology_flow import _safe_reason
+
+    text = _safe_reason(RuntimeError("403 key AIzaSyA1234567890abcdefghij and gsk_abcdefghij123456 Bearer tok123"))
+    assert "AIza" not in text and "gsk_" not in text and "tok123" not in text
+    assert "403" in text

@@ -8,7 +8,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from backend.core.config import settings
-from backend.core.exceptions import ValidationError
+import re
+
+from backend.core.exceptions import ModelError, ValidationError
 from backend.services.image_loader import prepare_image
 from backend.services.radiology_explainer import DISCLAIMER, explain_chest_findings
 from backend.services.url_fetcher import FetchError, detect_file
@@ -17,6 +19,14 @@ logger = logging.getLogger(__name__)
 
 # One limit for the whole app: the same setting the radiology service itself enforces.
 MAX_UPLOAD_BYTES = settings.MAX_UPLOAD_SIZE_MB * 1024 * 1024
+
+
+_SECRET = re.compile(r"(AIza[0-9A-Za-z_\-]{10,}|gsk_[0-9A-Za-z]{10,}|[Bb]earer\s+\S+)")
+
+
+def _safe_reason(error: Exception, limit: int = 400) -> str:
+    """The provider's own error text, with anything key-shaped removed and cut short."""
+    return _SECRET.sub("[hidden]", str(error)).strip()[:limit]
 
 
 class UploadError(Exception):
@@ -115,6 +125,9 @@ def analyze_upload(
             result["findings"], language, chain=chain_factory() if chain_factory else None)
     except ValidationError:
         raise UploadError("invalid_image", "This image could not be read. Try another file.") from None
+    except ModelError as e:
+        logger.exception("radiology analysis failed")
+        raise UploadError("analysis_failed", f"The analysis failed. {_safe_reason(e)}") from None
     except Exception:
         logger.exception("radiology analysis failed")           # server log only; no file name or content
         raise UploadError("analysis_failed", "The analysis failed. Please try again.") from None
