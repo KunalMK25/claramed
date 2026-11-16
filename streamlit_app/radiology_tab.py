@@ -56,15 +56,21 @@ def render_radiology_tab(language: str = "English") -> None:
     st.warning("This is AI model output, not a diagnosis. A qualified radiologist must interpret the image.")
     st.info("ClaraMed is a separate service from JeevaCare. Your image is not saved and is never sent to JeevaCare. "
             "Chest X-rays are analysed in memory; only a short text summary of the findings (never the image) goes "
-            "to the AI service that words the explanation. If you choose \"Other body part\", the image itself is "
-            "sent to that AI service (Gemini or Groq).")
+            "to the AI service that words the explanation. If you let ClaraMed detect the body part, or choose "
+            "\"Other body part\", the image itself is sent to that AI service (Gemini or Groq). Pick Chest to keep "
+            "a chest X-ray on this server.")
 
     back = jeevacare_url()
     if back:
         st.link_button("← Back to JeevaCare", back)
 
-    body_part = st.radio("What is this X-ray of?", ["chest", "other"], key="radiology_body_part", horizontal=True,
-                         format_func=lambda v: "Chest" if v == "chest" else "Other body part (hand, leg, spine...)")
+    labels = {
+        "auto": "Detect automatically (recommended)",
+        "chest": "Chest",
+        "other": "Other body part (hand, leg, spine...)",
+    }
+    body_part = st.radio("What is this X-ray of?", ["auto", "chest", "other"], key="radiology_body_part",
+                         horizontal=True, format_func=labels.get)
     upload = st.file_uploader("X-ray (PNG, JPEG, DICOM or PDF, up to 10 MB)",
                               type=["png", "jpg", "jpeg", "pdf", "dcm"], key="radiology_upload")
     if upload is None:

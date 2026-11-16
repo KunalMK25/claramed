@@ -86,6 +86,7 @@ def fake_model(monkeypatch):
 
 def upload_and_analyze(filename, content):
     at = new_app().run()
+    at.radio(key="radiology_body_part").set_value("chest")   # an explicit choice runs the local chest model
     at.file_uploader(key="radiology_upload").upload(filename, content, "image/png")
     at.run()
     at.button(key="radiology_analyze").click().run()
@@ -135,5 +136,23 @@ def test_results_lead_with_a_plain_english_explanation(fake_model):
 
 def test_the_uploader_accepts_pdf_and_dicom_and_the_page_offers_a_body_part_choice():
     at = new_app().run()
-    assert at.radio(key="radiology_body_part").value == "chest"
+    assert at.radio(key="radiology_body_part").value == "auto"      # detects the body part unless told
     assert at.file_uploader(key="radiology_upload").proto.type == [".png", ".jpg", ".jpeg", ".pdf", ".dcm"]
+
+
+def test_automatic_detection_sends_a_hand_xray_to_the_vision_reader(fake_model, monkeypatch):
+    monkeypatch.setattr("backend.services.xray_vision.detect_body_part", lambda path, llm=None: "other")
+    monkeypatch.setattr(
+        "backend.services.xray_vision.explain_other_xray",
+        lambda path, language="English", llm=None: {
+            "modality": "xray_other", "summary": None, "model_name": "gemini", "generated_by": "gemini",
+            "explanation": "## What your X-ray shows\n\nA hand.",
+        },
+    )
+    at = new_app().run()
+    at.file_uploader(key="radiology_upload").upload("hand.png", PNG, "image/png")
+    at.run()
+    at.button(key="radiology_analyze").click().run()
+    assert not at.exception, [e.message for e in at.exception]
+    assert any("A hand." in m.value for m in at.markdown)
+    assert not any("Pneumothorax" in m.value for m in at.markdown)   # the chest model never ran

@@ -100,3 +100,34 @@ def test_gemini_is_used_first_when_a_key_is_set(tmp_path, monkeypatch):
     assert sent["headers"]["x-goog-api-key"] == "test-key"
     assert "test-key" not in sent["url"]
     assert sent["json"]["contents"][0]["parts"][1]["inline_data"]["data"]
+
+
+class _Reply:
+    def __init__(self, content):
+        self.content = content
+
+
+class _Asker:
+    def __init__(self, content=None, error=None):
+        self.content, self.error = content, error
+
+    def invoke(self, messages):
+        if self.error:
+            raise self.error
+        return _Reply(self.content)
+
+
+@pytest.mark.parametrize("answer,expected", [
+    ("CHEST", "chest"), ("chest.", "chest"), ("OTHER", "other"), (" Other ", "other"),
+    ("maybe", None), ("", None),
+])
+def test_detect_body_part_reads_the_one_word_answer(tmp_path, answer, expected):
+    from backend.services.xray_vision import detect_body_part
+
+    assert detect_body_part(_png(tmp_path), llm=_Asker(answer)) == expected
+
+
+def test_detect_body_part_never_raises(tmp_path):
+    from backend.services.xray_vision import detect_body_part
+
+    assert detect_body_part(_png(tmp_path), llm=_Asker(error=RuntimeError("down"))) is None

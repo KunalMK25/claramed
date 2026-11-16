@@ -106,6 +106,16 @@ _working_gemini_model: Optional[str] = None  # the model that last worked; tried
 
 def _gemini_describe(image_path: Path, language: str) -> Optional[str]:
     """Describe the image with Google Gemini. Returns None when no key is set."""
+    return _gemini_generate(
+        image_path,
+        system=SYSTEM_PROMPT.format(language=language),
+        user_text=f"Please explain this X-ray to me in {language}.",
+        max_tokens=2048,
+    )
+
+
+def _gemini_generate(image_path: Path, system: str, user_text: str, max_tokens: int) -> Optional[str]:
+    """One Gemini call with an image. Returns None when no key is set."""
     api_key = getattr(settings, "GEMINI_API_KEY", None)
     if not api_key:
         return None
@@ -114,18 +124,18 @@ def _gemini_describe(image_path: Path, language: str) -> Optional[str]:
 
     mime, data = _image_parts(image_path)
     body = {
-        "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT.format(language=language)}]},
+        "systemInstruction": {"parts": [{"text": system}]},
         "contents": [{
             "role": "user",
             "parts": [
-                {"text": f"Please explain this X-ray to me in {language}."},
+                {"text": user_text},
                 {"inline_data": {"mime_type": mime, "data": data}},
             ],
         }],
-        "generationConfig": {"temperature": settings.GROQ_TEMPERATURE, "maxOutputTokens": 2048},
+        "generationConfig": {"temperature": settings.GROQ_TEMPERATURE, "maxOutputTokens": max_tokens},
     }
     try:
-        available = _current_gemini_models(api_key)
+        available = _cached_gemini_models(api_key)
     except Exception as e:
         logger.warning(f"Could not list Gemini models: {e}")
         available = []
@@ -156,6 +166,51 @@ def _gemini_describe(image_path: Path, language: str) -> Optional[str]:
     raise last or RuntimeError("Gemini returned nothing")
 
 
+_MODEL_LIST_TTL = 600  # seconds; Google changes its models rarely
+_model_list_cache = {"at": 0.0, "models": []}
+
+
+def _cached_gemini_models(api_key: str):
+    import time
+
+    if time.time() - _model_list_cache["at"] > _MODEL_LIST_TTL:
+        _model_list_cache["models"] = _current_gemini_models(api_key)
+        _model_list_cache["at"] = time.time()
+    return _model_list_cache["models"]
+
+
+BODY_PART_PROMPT = (
+    "You look at medical images. Reply with exactly one word. "
+    "Reply CHEST if the image is an X-ray of the chest or thorax (lungs, ribs, heart, collar bones). "
+    "Reply OTHER for an X-ray of any other body part (hand, wrist, arm, leg, foot, spine, skull, pelvis, abdomen...) "
+    "or if it is not an X-ray."
+)
+
+
+def detect_body_part(image_path: Path, llm: Optional[Any] = None) -> Optional[str]:
+    """
+    Which kind of X-ray is this? "chest", "other", or None when it cannot be told
+    (no image provider available, or an unclear answer). Never raises.
+    """
+    image_path = Path(image_path)
+    try:
+        if llm is not None:
+            reply = _groq_ask(image_path, BODY_PART_PROMPT, "Which body part is this?", llm)
+        elif getattr(settings, "GEMINI_API_KEY", None):
+            reply = _gemini_generate(image_path, BODY_PART_PROMPT, "Which body part is this?", max_tokens=256)
+        else:
+            reply = _groq_ask(image_path, BODY_PART_PROMPT, "Which body part is this?", _default_llm())
+    except Exception as e:
+        logger.warning(f"Body part detection failed: {e}")
+        return None
+    word = (reply or "").strip().lower()
+    if word.startswith("chest"):
+        return "chest"
+    if word.startswith("other"):
+        return "other"
+    return None
+
+
 def _model_order(configured: Optional[str], defaults):
     from backend.ai.groq_fallback import model_order
 
@@ -163,12 +218,18 @@ def _model_order(configured: Optional[str], defaults):
 
 
 def _groq_describe(image_path: Path, language: str, llm: Any) -> str:
+    return _groq_ask(
+        image_path, SYSTEM_PROMPT.format(language=language), f"Please explain this X-ray to me in {language}.", llm
+    )
+
+
+def _groq_ask(image_path: Path, system: str, user_text: str, llm: Any) -> str:
     from langchain_core.messages import HumanMessage, SystemMessage
 
     messages = [
-        SystemMessage(content=SYSTEM_PROMPT.format(language=language)),
+        SystemMessage(content=system),
         HumanMessage(content=[
-            {"type": "text", "text": f"Please explain this X-ray to me in {language}."},
+            {"type": "text", "text": user_text},
             {"type": "image_url", "image_url": {"url": _encode_image(image_path)}},
         ]),
     ]

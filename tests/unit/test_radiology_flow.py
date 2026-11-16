@@ -163,3 +163,34 @@ def test_provider_reason_is_shown_without_any_key():
     text = _safe_reason(RuntimeError("403 key AIzaSyA1234567890abcdefghij and gsk_abcdefghij123456 Bearer tok123"))
     assert "AIza" not in text and "gsk_" not in text and "tok123" not in text
     assert "403" in text
+
+
+def _vision_stub(seen):
+    def vision(path, language):
+        seen.append(path)
+        return {"modality": "xray_other", "summary": None, "model_name": "vision-model",
+                "generated_by": "vision_llm", "explanation": "A hand X-ray."}
+    return vision
+
+
+def test_auto_sends_a_hand_xray_to_the_vision_reader_and_never_loads_the_chest_model():
+    loads, seen = [], []
+    out = analyze_upload(PNG, lambda: loads.append(1), body_part="auto",
+                         vision=_vision_stub(seen), detect=lambda path: "other")
+    assert loads == [] and len(seen) == 1
+    assert out.explanation == "A hand X-ray." and out.findings == []
+
+
+def test_auto_sends_a_chest_xray_to_the_chest_model():
+    seen = []
+    out = analyze_upload(PNG, lambda: FakeService(), body_part="auto",
+                         vision=_vision_stub(seen), detect=lambda path: "chest")
+    assert seen == []
+    assert out.findings  # produced by the chest model
+
+
+def test_auto_asks_the_user_to_choose_when_the_body_part_cannot_be_told():
+    with pytest.raises(UploadError) as e:
+        analyze_upload(PNG, lambda: FakeService(), body_part="auto", detect=lambda path: None)
+    assert e.value.code == "body_part_unknown"
+    assert "choose" in e.value.message.lower()

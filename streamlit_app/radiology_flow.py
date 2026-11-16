@@ -58,7 +58,7 @@ class RadiologyOutcome:
         return self.findings[:n]
 
 
-BODY_PARTS = ("chest", "other")
+BODY_PARTS = ("auto", "chest", "other")
 
 
 def _detect_extension(data: bytes) -> str:
@@ -80,6 +80,12 @@ def _default_vision(path: Path, language: str) -> dict:
     return explain_other_xray(path, language)
 
 
+def _default_detect(path: Path) -> Optional[str]:
+    from backend.services.xray_vision import detect_body_part
+
+    return detect_body_part(path)
+
+
 def analyze_upload(
     data: bytes,
     get_service: Callable[[], object],
@@ -87,12 +93,14 @@ def analyze_upload(
     body_part: str = "chest",
     chain_factory: Optional[Callable[[], object]] = None,
     vision: Callable[[Path, str], dict] = _default_vision,
+    detect: Callable[[Path], Optional[str]] = _default_detect,
 ) -> RadiologyOutcome:
     """
     Validate `data` as a PNG/JPEG/DICOM/PDF X-ray, analyse it and explain the result in plain English.
     The bytes touch disk only in temp files, always removed.
 
-    `body_part="chest"` runs the chest model from `get_service()` (an object with
+    `body_part="auto"` first asks a vision model which kind of X-ray this is (the image leaves the server
+    for that question), then continues as "chest" or "other". `body_part="chest"` runs the chest model from `get_service()` (an object with
     `analyze_chest_xray(path) -> dict`); `"other"` asks the vision LLM instead (the image leaves the server).
     The service is only requested AFTER the upload passed validation, because loading the model is
     expensive and a bad file should never trigger it. `chain_factory` builds the LLM that words the
@@ -115,6 +123,13 @@ def analyze_upload(
             tmp.write(data)
             path = Path(tmp.name)
         image = prepare_image(path)                              # PDF / DICOM -> PNG; PNG / JPEG unchanged
+        if body_part == "auto":
+            body_part = detect(image)
+            if body_part not in ("chest", "other"):
+                raise UploadError(
+                    "body_part_unknown",
+                    "We could not tell which body part this X-ray shows. Please choose Chest or Other body part and try again.",
+                )
         if body_part == "other":
             started = time.perf_counter()
             result = vision(image, language)
@@ -123,6 +138,8 @@ def analyze_upload(
         result = get_service().analyze_chest_xray(image)
         explained = explain_chest_findings(
             result["findings"], language, chain=chain_factory() if chain_factory else None)
+    except UploadError:
+        raise
     except ValidationError:
         raise UploadError("invalid_image", "This image could not be read. Try another file.") from None
     except ModelError as e:
