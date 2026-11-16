@@ -101,6 +101,9 @@ def _current_gemini_models(api_key: str):
     return flash
 
 
+_working_gemini_model: Optional[str] = None  # the model that last worked; tried first next time
+
+
 def _gemini_describe(image_path: Path, language: str) -> Optional[str]:
     """Describe the image with Google Gemini. Returns None when no key is set."""
     api_key = getattr(settings, "GEMINI_API_KEY", None)
@@ -126,19 +129,25 @@ def _gemini_describe(image_path: Path, language: str) -> Optional[str]:
     except Exception as e:
         logger.warning(f"Could not list Gemini models: {e}")
         available = []
+    global _working_gemini_model
     last: Optional[Exception] = None
-    for model in _model_order(available[0] if available else None, [*available[1:3], *GEMINI_MODELS, getattr(settings, "GEMINI_VISION_MODEL", None)]):
+    order = _model_order(
+        _working_gemini_model,
+        [*available[:3], *GEMINI_MODELS, getattr(settings, "GEMINI_VISION_MODEL", None)],
+    )
+    for model in order:
         try:
             resp = httpx.post(
                 GEMINI_URL.format(model=model),
                 json=body,
                 headers={"x-goog-api-key": api_key},
-                timeout=60,
+                timeout=40,
             )
             resp.raise_for_status()
             parts = resp.json()["candidates"][0]["content"]["parts"]
             text = "".join(p.get("text", "") for p in parts).strip()
             if text:
+                _working_gemini_model = model
                 return text
             last = ValueError(f"{model} returned no text")
         except Exception as e:  # try the next model
