@@ -96,7 +96,7 @@ def test_gemini_is_used_first_when_a_key_is_set(tmp_path, monkeypatch):
 
     assert result["generated_by"] == "gemini"
     assert "fractured wrist" in result["explanation"]
-    assert "gemini-3.1-flash:generateContent" in sent["url"]  # newest stable flash, not lite or preview
+    assert "lite" not in sent["url"] and "embed" not in sent["url"]   # a lite or non-image model is never used
     assert sent["headers"]["x-goog-api-key"] == "test-key"
     assert "test-key" not in sent["url"]
     assert sent["json"]["contents"][0]["parts"][1]["inline_data"]["data"]
@@ -131,3 +131,40 @@ def test_detect_body_part_never_raises(tmp_path):
     from backend.services.xray_vision import detect_body_part
 
     assert detect_body_part(_png(tmp_path), llm=_Asker(error=RuntimeError("down"))) is None
+
+
+def test_a_slow_or_retired_model_does_not_hold_up_a_working_one(tmp_path, monkeypatch):
+    import time
+    from backend.services import xray_vision
+
+    monkeypatch.setattr(xray_vision.settings, "GEMINI_API_KEY", "test-key", raising=False)
+    monkeypatch.setattr(xray_vision, "_cached_gemini_models", lambda key: ["slow-model", "gone-model", "fast-model"])
+    monkeypatch.setattr(xray_vision, "_working_gemini_model", None)
+
+    class _Resp:
+        def __init__(self, text=None, status=200):
+            self._text, self.status_code = text, status
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                import httpx
+                raise httpx.HTTPStatusError("bad", request=None, response=self)
+
+        def json(self):
+            if self.status_code >= 400:
+                return {"error": {"message": "model not found"}}
+            return {"candidates": [{"content": {"parts": [{"text": self._text}]}}]}
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        if "slow-model" in url:
+            time.sleep(3)
+            return _Resp("slow answer")
+        if "gone-model" in url:
+            return _Resp(status=404)
+        return _Resp("fast answer")
+
+    monkeypatch.setattr("httpx.post", fake_post)
+    started = time.time()
+    result = explain_other_xray(_png(tmp_path), language="English")
+    assert "fast answer" in result["explanation"]
+    assert time.time() - started < 2.5            # did not wait for the slow model

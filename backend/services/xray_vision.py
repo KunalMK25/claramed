@@ -141,32 +141,50 @@ def _gemini_generate(image_path: Path, system: str, user_text: str, max_tokens: 
         available = []
     global _working_gemini_model
     attempts = []
+    # Every model Google lists for this key is a candidate, tried a few at a time in parallel:
+    # the first real answer wins, so one slow or retired model never decides how long it takes.
     order = _model_order(
         _working_gemini_model,
-        [*available[:3], *GEMINI_MODELS, getattr(settings, "GEMINI_VISION_MODEL", None)],
+        [*available, *GEMINI_MODELS, getattr(settings, "GEMINI_VISION_MODEL", None)],
     )
-    for model in order:
+
+    def ask(model):
+        resp = httpx.post(
+            GEMINI_URL.format(model=model),
+            json=body,
+            headers={"x-goog-api-key": api_key},
+            timeout=60,
+        )
+        resp.raise_for_status()
+        parts = resp.json()["candidates"][0]["content"]["parts"]
+        return "".join(p.get("text", "") for p in parts).strip()
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    for start in range(0, len(order), _PARALLEL_MODELS):
+        batch = order[start:start + _PARALLEL_MODELS]
+        pool = ThreadPoolExecutor(max_workers=len(batch))
+        futures = {pool.submit(ask, model): model for model in batch}
         try:
-            resp = httpx.post(
-                GEMINI_URL.format(model=model),
-                json=body,
-                headers={"x-goog-api-key": api_key},
-                timeout=40,
-            )
-            resp.raise_for_status()
-            parts = resp.json()["candidates"][0]["content"]["parts"]
-            text = "".join(p.get("text", "") for p in parts).strip()
-            if text:
-                _working_gemini_model = model
-                return text
-            attempts.append(f"{model}: no text returned")
-        except Exception as e:  # try the next model
-            logger.warning(f"Gemini model {model} failed: {e}")
-            attempts.append(f"{model}: {_short_reason(e)}")
+            for future in as_completed(futures):
+                model = futures[future]
+                try:
+                    text = future.result()
+                except Exception as e:
+                    logger.warning(f"Gemini model {model} failed: {e}")
+                    attempts.append(f"{model}: {_short_reason(e)}")
+                    continue
+                if text:
+                    _working_gemini_model = model
+                    return text
+                attempts.append(f"{model}: no text returned")
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
     listed = ", ".join(available[:5]) or "none (model list unavailable)"
     raise RuntimeError(f"tried {'; '.join(attempts)}. Models Google lists for this key: {listed}")
 
 
+_PARALLEL_MODELS = 3
 _MODEL_LIST_TTL = 600  # seconds; Google changes its models rarely
 _model_list_cache = {"at": 0.0, "models": []}
 

@@ -124,12 +124,11 @@ def analyze_upload(
             path = Path(tmp.name)
         image = prepare_image(path)                              # PDF / DICOM -> PNG; PNG / JPEG unchanged
         if body_part == "auto":
+            # When the body part cannot be told, the general reader still describes any X-ray,
+            # so the person always gets an analysis rather than a request to choose.
             body_part = detect(image)
-            if body_part not in ("chest", "other"):
-                raise UploadError(
-                    "body_part_unknown",
-                    "We could not tell which body part this X-ray shows. Please choose Chest or Other body part and try again.",
-                )
+            if body_part != "chest":
+                body_part = "other"
         if body_part == "other":
             started = time.perf_counter()
             result = vision(image, language)

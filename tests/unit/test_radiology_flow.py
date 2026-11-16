@@ -189,8 +189,9 @@ def test_auto_sends_a_chest_xray_to_the_chest_model():
     assert out.findings  # produced by the chest model
 
 
-def test_auto_asks_the_user_to_choose_when_the_body_part_cannot_be_told():
-    with pytest.raises(UploadError) as e:
-        analyze_upload(PNG, lambda: FakeService(), body_part="auto", detect=lambda path: None)
-    assert e.value.code == "body_part_unknown"
-    assert "choose" in e.value.message.lower()
+def test_auto_still_analyses_when_the_body_part_cannot_be_told():
+    loads, seen = [], []
+    out = analyze_upload(PNG, lambda: loads.append(1), body_part="auto",
+                         vision=_vision_stub(seen), detect=lambda path: None)
+    assert loads == [] and len(seen) == 1          # the general reader handles any X-ray
+    assert out.explanation == "A hand X-ray."
