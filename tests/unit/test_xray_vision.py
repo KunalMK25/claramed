@@ -1,6 +1,8 @@
+import pytest
 """Unit tests for the vision-LLM explainer used for non-chest X-rays."""
 from PIL import Image
 
+from backend.core.exceptions import ModelError
 from backend.services.xray_vision import explain_other_xray
 
 
@@ -45,15 +47,41 @@ def test_result_has_explanation_disclaimer_and_vision_source(tmp_path):
     assert result["modality"] == "xray_other"
 
 
-def test_llm_failure_returns_safe_unavailable_message(tmp_path):
-    result = explain_other_xray(
-        _png(tmp_path), language="English", llm=_FakeVisionLLM(error=RuntimeError("boom"))
-    )
-    assert result["generated_by"] == "unavailable"
-    assert "could not" in result["explanation"].lower()
-    assert "doctor" in result["explanation"].lower()
+def test_failure_raises_with_the_real_reason_instead_of_inventing_text(tmp_path):
+    with pytest.raises(ModelError) as caught:
+        explain_other_xray(
+            _png(tmp_path), language="English", llm=_FakeVisionLLM(error=RuntimeError("boom"))
+        )
+    assert "boom" in str(caught.value)
 
 
-def test_blank_reply_returns_unavailable(tmp_path):
-    result = explain_other_xray(_png(tmp_path), language="English", llm=_FakeVisionLLM(reply=" "))
-    assert result["generated_by"] == "unavailable"
+def test_blank_reply_raises(tmp_path):
+    with pytest.raises(ModelError):
+        explain_other_xray(_png(tmp_path), language="English", llm=_FakeVisionLLM(reply=" "))
+
+
+def test_gemini_is_used_first_when_a_key_is_set(tmp_path, monkeypatch):
+    from backend.services import xray_vision
+
+    monkeypatch.setattr(xray_vision.settings, "GEMINI_API_KEY", "test-key", raising=False)
+    sent = {}
+
+    class _Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"candidates": [{"content": {"parts": [{"text": "A fractured wrist."}]}}]}
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        sent["url"], sent["json"], sent["headers"] = url, json, headers
+        return _Resp()
+
+    monkeypatch.setattr("httpx.post", fake_post)
+    result = explain_other_xray(_png(tmp_path), language="English")
+
+    assert result["generated_by"] == "gemini"
+    assert "fractured wrist" in result["explanation"]
+    assert sent["headers"]["x-goog-api-key"] == "test-key"
+    assert "test-key" not in sent["url"]
+    assert sent["json"]["contents"][0]["parts"][1]["inline_data"]["data"]

@@ -42,6 +42,9 @@ class Settings(BaseSettings):
     GROQ_API_KEY: Optional[str] = None
     GROQ_MODEL: str = "openai/gpt-oss-20b"
     GROQ_VISION_MODEL: str = "meta-llama/llama-4-scout-17b-16e-instruct"  # non-chest X-rays
+    # Google Gemini, used first for non-chest X-rays when a key is set
+    GEMINI_API_KEY: Optional[str] = None
+    GEMINI_VISION_MODEL: str = "gemini-flash-latest"
     GROQ_TEMPERATURE: float = 0.2
     GROQ_MAX_TOKENS: int = 1024
     
