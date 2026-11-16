@@ -52,10 +52,9 @@ def _encode_image(path: Path) -> str:
 
 
 def _default_llm():
-    from langchain_groq import ChatGroq
+    from backend.ai.groq_fallback import vision_llm
 
-    return ChatGroq(
-        model=settings.GROQ_VISION_MODEL,
+    return vision_llm(
         temperature=settings.GROQ_TEMPERATURE,
         max_tokens=settings.GROQ_MAX_TOKENS,
         api_key=settings.GROQ_API_KEY,

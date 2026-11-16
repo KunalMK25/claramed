@@ -4,7 +4,7 @@ LLM Provider Abstraction
 Provides a clean interface for LLM interactions with multiple provider support.
 """
 from typing import Optional, Dict, Any
-from langchain_groq import ChatGroq
+from backend.ai.groq_fallback import TEXT_MODELS, build_llm, model_order
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from backend.core.config import settings
@@ -42,11 +42,11 @@ class LLMProvider:
                         model_name=self.model
                     )
                 
-                self._llm = ChatGroq(
-                    model=self.model,
-                    temperature=self.temperature,
-                    max_tokens=self.max_tokens,
-                    api_key=settings.GROQ_API_KEY,
+                self._llm = build_llm(
+                    model_order(self.model, TEXT_MODELS),
+                    self.temperature,
+                    self.max_tokens,
+                    settings.GROQ_API_KEY,
                 )
                 logger.info(f"Initialized Groq LLM: {self.model}")
             

@@ -1,15 +1,11 @@
 import os
-from langchain_groq import ChatGroq
+from backend.ai.groq_fallback import text_llm
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
 def get_symptom_chain():
     # Initialize the Groq LLM with the replacement model
-    llm = ChatGroq(
-        model="llama-3.1-8b-instant",
-        temperature=0.2,
-        max_tokens=1024,
-    )
+    llm = text_llm(temperature=0.2, max_tokens=1024)
     
     # Create the prompt template
     prompt = ChatPromptTemplate.from_messages([
@@ -29,11 +25,7 @@ def get_symptom_chain():
 
 def get_emergency_chain():
     # Initialize the Groq LLM for classification using the replacement model
-    llm = ChatGroq(
-        model="llama-3.1-8b-instant",
-        temperature=0.0,
-        max_tokens=10,
-    )
+    llm = text_llm(temperature=0.0, max_tokens=512)
     
     # Create the prompt template
     prompt = ChatPromptTemplate.from_messages([
@@ -49,11 +41,7 @@ def get_emergency_chain():
 
 def get_report_explainer_chain():
     # Initialize the Groq LLM for explanation
-    llm = ChatGroq(
-        model="llama-3.1-8b-instant",
-        temperature=0.2,
-        max_tokens=2048,
-    )
+    llm = text_llm(temperature=0.2, max_tokens=2048)
     
     # Create the prompt template
     prompt = ChatPromptTemplate.from_messages([
@@ -72,11 +60,7 @@ def get_report_explainer_chain():
 
 def get_wellness_tips_chain():
     # Initialize the Groq LLM for wellness tips
-    llm = ChatGroq(
-        model="llama-3.1-8b-instant",
-        temperature=0.3,
-        max_tokens=1024,
-    )
+    llm = text_llm(temperature=0.3, max_tokens=1024)
     
     # Create the prompt template
     prompt = ChatPromptTemplate.from_messages([

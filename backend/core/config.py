@@ -40,7 +40,7 @@ class Settings(BaseSettings):
     
     # Groq AI
     GROQ_API_KEY: Optional[str] = None
-    GROQ_MODEL: str = "llama-3.1-8b-instant"
+    GROQ_MODEL: str = "openai/gpt-oss-20b"
     GROQ_VISION_MODEL: str = "meta-llama/llama-4-scout-17b-16e-instruct"  # non-chest X-rays
     GROQ_TEMPERATURE: float = 0.2
     GROQ_MAX_TOKENS: int = 1024
