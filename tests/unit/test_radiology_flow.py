@@ -182,11 +182,10 @@ def test_auto_sends_a_hand_xray_to_the_vision_reader_and_never_loads_the_chest_m
 
 
 def test_auto_sends_a_chest_xray_to_the_chest_model():
-    seen = []
     out = analyze_upload(PNG, lambda: FakeService(), body_part="auto",
-                         vision=_vision_stub(seen), detect=lambda path: "chest")
-    assert seen == []
-    assert out.findings  # produced by the chest model
+                         vision=_vision_stub([]), detect=lambda path: "chest")
+    assert out.findings  # produced by the chest model, not the general reader
+    assert out.explanation != "A hand X-ray."
 
 
 def test_auto_still_analyses_when_the_body_part_cannot_be_told():
@@ -195,3 +194,21 @@ def test_auto_still_analyses_when_the_body_part_cannot_be_told():
                          vision=_vision_stub(seen), detect=lambda path: None)
     assert loads == [] and len(seen) == 1          # the general reader handles any X-ray
     assert out.explanation == "A hand X-ray."
+
+
+def test_auto_reads_and_detects_at_the_same_time():
+    import time
+
+    def slow_detect(path):
+        time.sleep(1.0)
+        return "other"
+
+    def slow_vision(path, language):
+        time.sleep(1.0)
+        return {"modality": "xray_other", "summary": None, "model_name": "m",
+                "generated_by": "vision_llm", "explanation": "A hand X-ray."}
+
+    started = time.time()
+    out = analyze_upload(PNG, lambda: FakeService(), body_part="auto", vision=slow_vision, detect=slow_detect)
+    assert out.explanation == "A hand X-ray."
+    assert time.time() - started < 1.8          # about one second, not two

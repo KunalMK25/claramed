@@ -123,15 +123,26 @@ def analyze_upload(
             tmp.write(data)
             path = Path(tmp.name)
         image = prepare_image(path)                              # PDF / DICOM -> PNG; PNG / JPEG unchanged
+        reading = None
         if body_part == "auto":
-            # When the body part cannot be told, the general reader still describes any X-ray,
-            # so the person always gets an analysis rather than a request to choose.
-            body_part = detect(image)
-            if body_part != "chest":
-                body_part = "other"
+            # Ask which kind of X-ray this is and start the general reading at the same time, so the
+            # common case (not a chest) costs one wait instead of two. When it turns out to be a chest,
+            # the general reading is simply not used. If the kind cannot be told, the general reader
+            # still describes any X-ray, so the person always gets an analysis.
+            from concurrent.futures import ThreadPoolExecutor
+
+            pool = ThreadPoolExecutor(max_workers=2)
+            try:
+                detecting = pool.submit(detect, image)
+                reading = pool.submit(vision, image, language)
+                body_part = "chest" if detecting.result() == "chest" else "other"
+                if body_part == "chest":
+                    reading.cancel()                      # not needed; a reading already under way is just ignored
+            finally:
+                pool.shutdown(wait=False)
         if body_part == "other":
             started = time.perf_counter()
-            result = vision(image, language)
+            result = reading.result() if reading is not None else vision(image, language)
             return RadiologyOutcome([], DISCLAIMER, result["model_name"], time.perf_counter() - started,
                                     result["explanation"], None, result["generated_by"])
         result = get_service().analyze_chest_xray(image)
