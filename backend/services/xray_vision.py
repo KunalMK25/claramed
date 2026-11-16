@@ -69,7 +69,36 @@ def _default_llm():
 
 
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-GEMINI_MODELS = ["gemini-flash-latest", "gemini-2.5-flash"]
+GEMINI_LIST_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+GEMINI_MODELS = ["gemini-flash-latest", "gemini-2.5-flash"]  # last resort if the model list cannot be read
+_NOT_FOR_IMAGES = ("lite", "tts", "image", "live", "embedding", "audio", "robotics", "computer", "learnlm")
+
+
+def _version(name: str):
+    """gemini-3.1-flash -> (3, 1); used to put the newest model first."""
+    import re
+
+    return tuple(int(n) for n in re.findall(r"\d+", name.split("flash")[0])) or (0,)
+
+
+def _current_gemini_models(api_key: str):
+    """Flash models the key can use right now, newest stable first. Google retires models often."""
+    import httpx
+
+    resp = httpx.get(GEMINI_LIST_URL, headers={"x-goog-api-key": api_key}, params={"pageSize": 200}, timeout=20)
+    resp.raise_for_status()
+    names = [
+        m["name"].removeprefix("models/")
+        for m in resp.json().get("models", [])
+        if "generateContent" in m.get("supportedGenerationMethods", [])
+    ]
+    flash = [
+        n for n in names
+        if n.startswith("gemini-") and "flash" in n and not any(bad in n for bad in _NOT_FOR_IMAGES)
+    ]
+    # Stable before preview/experimental, then newest version first.
+    flash.sort(key=lambda n: (("preview" in n or "exp" in n), tuple(-v for v in _version(n)), n))
+    return flash
 
 
 def _gemini_describe(image_path: Path, language: str) -> Optional[str]:
@@ -92,14 +121,19 @@ def _gemini_describe(image_path: Path, language: str) -> Optional[str]:
         }],
         "generationConfig": {"temperature": settings.GROQ_TEMPERATURE, "maxOutputTokens": 2048},
     }
+    try:
+        available = _current_gemini_models(api_key)
+    except Exception as e:
+        logger.warning(f"Could not list Gemini models: {e}")
+        available = []
     last: Optional[Exception] = None
-    for model in _model_order(getattr(settings, "GEMINI_VISION_MODEL", None), GEMINI_MODELS):
+    for model in _model_order(available[0] if available else None, [*available[1:3], *GEMINI_MODELS, getattr(settings, "GEMINI_VISION_MODEL", None)]):
         try:
             resp = httpx.post(
                 GEMINI_URL.format(model=model),
                 json=body,
                 headers={"x-goog-api-key": api_key},
-                timeout=90,
+                timeout=60,
             )
             resp.raise_for_status()
             parts = resp.json()["candidates"][0]["content"]["parts"]

@@ -77,11 +77,26 @@ def test_gemini_is_used_first_when_a_key_is_set(tmp_path, monkeypatch):
         sent["url"], sent["json"], sent["headers"] = url, json, headers
         return _Resp()
 
+    class _Models:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"models": [
+                {"name": "models/gemini-2.5-flash", "supportedGenerationMethods": ["generateContent"]},
+                {"name": "models/gemini-3.1-flash-lite", "supportedGenerationMethods": ["generateContent"]},
+                {"name": "models/gemini-3.1-flash", "supportedGenerationMethods": ["generateContent"]},
+                {"name": "models/gemini-4-flash-preview", "supportedGenerationMethods": ["generateContent"]},
+                {"name": "models/text-embedding", "supportedGenerationMethods": ["embedContent"]},
+            ]}
+
+    monkeypatch.setattr("httpx.get", lambda *a, **k: _Models())
     monkeypatch.setattr("httpx.post", fake_post)
     result = explain_other_xray(_png(tmp_path), language="English")
 
     assert result["generated_by"] == "gemini"
     assert "fractured wrist" in result["explanation"]
+    assert "gemini-3.1-flash:generateContent" in sent["url"]  # newest stable flash, not lite or preview
     assert sent["headers"]["x-goog-api-key"] == "test-key"
     assert "test-key" not in sent["url"]
     assert sent["json"]["contents"][0]["parts"][1]["inline_data"]["data"]
